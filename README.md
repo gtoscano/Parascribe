@@ -140,8 +140,9 @@ durations, speaker counts, and licenses, is included):
 - **Oyez** (U.S. Supreme Court oral arguments, CC-BY-NC) — <https://www.oyez.org/>
 
 To rebuild the benchmark set from those public sources, run
-`testing_audio/build_dataset.py` (needs `requests xmltodict` + `ffmpeg`, and
-normal internet access):
+`testing_audio/build_dataset.py` (needs `requests` + `ffmpeg`, and normal
+internet access; the AMI converter's `xmltodict` dependency is installed into
+an ignored local directory when needed):
 
 ```bash
 python3 testing_audio/build_dataset.py all      # download, trim, and write manifest.csv

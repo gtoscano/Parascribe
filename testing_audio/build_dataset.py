@@ -23,6 +23,7 @@ Usage:
 """
 
 import csv
+import importlib.util
 import json
 import os
 import re
@@ -32,6 +33,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "dataset"
+LOCAL_PYTHON_DEPS = ROOT / ".python-deps"
 CLIP_SECONDS = 40 * 60  # cap clips at 40 minutes; shorter recordings are used in full
 
 # ---------------------------------------------------------------------------
@@ -51,6 +53,24 @@ NUM_OYEZ_CASES = 12
 def run(cmd, **kw):
     print("+", " ".join(cmd))
     subprocess.run(cmd, check=True, **kw)
+
+
+def ensure_local_python_dependency(import_name, package_name=None):
+    """Install a missing package locally without modifying the system Python."""
+    if importlib.util.find_spec(import_name) is not None:
+        return None
+
+    if ((LOCAL_PYTHON_DEPS / import_name).exists()
+            or (LOCAL_PYTHON_DEPS / f"{import_name}.py").exists()):
+        return LOCAL_PYTHON_DEPS
+
+    package_name = package_name or import_name
+    print(f"installing {package_name} into {LOCAL_PYTHON_DEPS}...")
+    run([
+        sys.executable, "-m", "pip", "install", "--quiet",
+        "--target", str(LOCAL_PYTHON_DEPS), package_name,
+    ])
+    return LOCAL_PYTHON_DEPS
 
 
 def write_plain_text(turns, txt_path):
@@ -255,10 +275,21 @@ def setup_ami():
         input_dir.parent.mkdir(parents=True, exist_ok=True)
         run(["unzip", "-q", str(zip_path), "-d", str(input_dir)])
 
-    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "xmltodict"], check=True)
+    local_deps = ensure_local_python_dependency("xmltodict")
+    converter_env = os.environ.copy()
+    if local_deps is not None:
+        existing_pythonpath = converter_env.get("PYTHONPATH")
+        converter_env["PYTHONPATH"] = (
+            str(local_deps) if not existing_pythonpath
+            else str(local_deps) + os.pathsep + existing_pythonpath
+        )
 
     print("converting NXT annotations -> per-meeting JSON transcripts...")
-    run([sys.executable, "dialogueActs.py"], cwd=str(AMI_CONVERTER_DIR / "ami-corpus"))
+    run(
+        [sys.executable, "dialogueActs.py"],
+        cwd=str(AMI_CONVERTER_DIR / "ami-corpus"),
+        env=converter_env,
+    )
     print(f"done. JSON transcripts in {AMI_CONVERTER_DIR / 'ami-corpus' / 'output' / 'dialogueActs'}")
 
 

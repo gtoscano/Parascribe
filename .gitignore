@@ -32,6 +32,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+testing_audio/.python-deps/
 
 # --- LaTeX build intermediates (paper/main.pdf IS committed) ---
 paper/*.aux
