@@ -1,0 +1,262 @@
+# WhisperX API — Speech-to-Text with Speaker Diarization
+
+A self-hosted transcription service that turns English audio into a
+**speaker-labeled transcript** (`Speaker 1:`, `Speaker 2:`, …) using
+[WhisperX](https://github.com/m-bain/whisperX): Whisper `large-v3` for
+transcription, word-level alignment, and [pyannote](https://github.com/pyannote/pyannote-audio)
+for diarization.
+
+It runs as a Docker Compose service alongside your vLLM models — start/pause it
+the same way. Transcripts can be retrieved over a simple HTTP API or read
+directly as files on disk.
+
+- **GPU:** 1 (so it coexists with a model on GPU 0)
+- **Port:** `8357`  (vLLM models use 8355 / 8356)
+- **Host (LAN):** `http://192.168.2.101:8357`
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `docker-compose-whisperx.yml` | The service definition (GPU, port, env, healthcheck) |
+| `whisperx/Dockerfile` | Image: PyTorch 2.7 + CUDA 12.8 + cuDNN 9 (required for Blackwell) + WhisperX |
+| `whisperx/requirements.txt` | Pinned WhisperX version |
+| `whisperx/server.py` | FastAPI app: transcribe → align → diarize → relabel speakers |
+| `whisperx/data/` | Created at runtime — `in/` uploads, `out/<job_id>/` transcripts |
+| `transcribe.py` | Client: upload audio, fetch transcript (optional summarize) |
+| `test_whisperx.py` | Smoke/E2E test against the API |
+
+### Which script do I use? (`transcribe.py` vs `test_whisperx.py`)
+
+**Both talk to the same WhisperX container over HTTP** — neither runs the model
+on your machine; the GPU work always happens inside the container. They differ
+only in *purpose*, not in where they run:
+
+| | `transcribe.py` | `test_whisperx.py` |
+|---|---|---|
+| Purpose | Day-to-day transcription | Verify the service is healthy/correct (diagnostic) |
+| Output | Saves `<file>.transcript.txt` next to your audio | A pass/fail test report |
+| Default URL | `http://localhost:8357` | `http://192.168.2.101:8357` (LAN IP) |
+| Override URL | `WHISPERX_URL=...` env var | `--url ...` flag |
+
+Use `transcribe.py` for real work; use `test_whisperx.py` to confirm the server
+is up. The differing default URL is just convenience (run the client on the GPU
+box, run the test from anywhere on the LAN) — either can point anywhere.
+
+---
+
+## One-time setup
+
+The HF token must be in `.env` as `HUGGINGFACE_HUB_TOKEN` (already present), and
+you must accept the pyannote licenses **once** while logged into Hugging Face:
+
+- https://huggingface.co/pyannote/speaker-diarization-3.1
+- https://huggingface.co/pyannote/segmentation-3.0
+
+Without this, the service still transcribes but speaker labels come back as
+`Speaker ?`.
+
+---
+
+## Running the service
+
+```bash
+# Build the image (first time, or after editing the Dockerfile/server)
+docker compose -f docker-compose-whisperx.yml build
+
+# Start in the background
+docker compose -f docker-compose-whisperx.yml up -d
+
+# Pause / resume (like your other projects)
+docker compose -f docker-compose-whisperx.yml stop
+docker compose -f docker-compose-whisperx.yml start
+
+# Logs / status
+docker compose -f docker-compose-whisperx.yml logs -f
+docker compose -f docker-compose-whisperx.yml ps
+
+# Tear down
+docker compose -f docker-compose-whisperx.yml down
+```
+
+> **First request is slow**: Whisper `large-v3` (~3 GB) and the pyannote models
+> download on the first transcription. They are cached in `~/.cache/huggingface`
+> afterwards.
+
+---
+
+## Using the client
+
+`transcribe.py` uploads an audio file, polls until the job finishes, and saves
+the transcript next to the audio file.
+
+```bash
+# Auto-detect the number of speakers
+python transcribe.py meeting.m4a
+
+# If you know the count, accuracy improves noticeably
+python transcribe.py meeting.m4a --num-speakers 3
+
+# Or bound it
+python transcribe.py meeting.m4a --min-speakers 2 --max-speakers 5
+
+# Transcription only, no speaker labels (faster)
+python transcribe.py meeting.m4a --no-diarize
+```
+
+Output is written to `meeting.transcript.txt` and looks like:
+
+```
+Speaker 1: Thanks everyone for joining today. Let's get started.
+
+Speaker 2: Sure — I'll begin with the project update.
+```
+
+### Pointing the client at another host
+
+By default `transcribe.py` talks to `http://localhost:8357`. To use a different
+IP/port, pick whichever is convenient:
+
+```bash
+# 1. --url flag (matches test_whisperx.py)
+python transcribe.py meeting.m4a --url http://192.168.2.101:8357
+
+# 2. WHISPERX_URL environment variable
+WHISPERX_URL=http://192.168.2.101:8357 python transcribe.py meeting.m4a
+```
+
+For the optional summarizer, `--vllm-url` (or the `VLLM_URL` env var) overrides
+the vLLM endpoint the same way. To change the permanent defaults, edit the
+`WHISPERX_URL` / `VLLM_URL` lines near the top of `transcribe.py`.
+
+> Summarization is handled separately on your side. The client has an optional
+> `--summarize` flag that posts the transcript to a vLLM server, but it is not
+> required for transcription.
+
+---
+
+## Testing
+
+```bash
+# Endpoint checks only (health + model info), no audio needed
+python test_whisperx.py
+
+# Full end-to-end test with your own audio
+python test_whisperx.py meeting.m4a --num-speakers 3
+
+# No audio handy? Generate a 2-speaker clip (needs espeak-ng + ffmpeg locally)
+python test_whisperx.py --make-sample
+```
+
+The test targets `http://192.168.2.101:8357` by default (override with `--url`).
+
+---
+
+## HTTP API
+
+Base URL: `http://192.168.2.101:8357`
+
+| Method & path | Description |
+|---|---|
+| `GET /health` | Liveness + whether diarization is enabled |
+| `GET /v1/models` | Active whisper model, device, compute type |
+| `POST /v1/transcribe` | Multipart upload, returns `{job_id}` (HTTP 202) |
+| `GET /v1/jobs` | List all jobs |
+| `GET /v1/jobs/{id}` | Job status + result when done |
+| `GET /v1/jobs/{id}/transcript.txt` | Speaker-labeled plain text |
+| `GET /v1/jobs/{id}/transcript.srt` | Subtitles with speaker tags |
+| `GET /v1/jobs/{id}/result.json` | Full result: segments, word timestamps, speaker map |
+
+`POST /v1/transcribe` form fields:
+
+| Field | Default | Notes |
+|---|---|---|
+| `file` | — | The audio/video file (required) |
+| `language` | `en` | ISO code; omit to auto-detect |
+| `diarize` | `true` | Set `false` to skip speaker labeling |
+| `num_speakers` | — | Exact count, if known |
+| `min_speakers` / `max_speakers` | — | Bounds when count is unknown |
+
+### Example with curl
+
+```bash
+# Submit
+curl -s -F "file=@meeting.m4a" -F "num_speakers=3" \
+     http://192.168.2.101:8357/v1/transcribe
+# -> {"job_id":"abc123...","status":"queued",...}
+
+# Poll
+curl -s http://192.168.2.101:8357/v1/jobs/abc123
+
+# Fetch the transcript
+curl -s http://192.168.2.101:8357/v1/jobs/abc123/transcript.txt
+```
+
+Jobs run **one at a time** (the GPU processes serially); submit many and poll
+each `job_id`.
+
+---
+
+## Retrieving transcripts as files
+
+Every finished job also writes to `whisperx/data/out/<job_id>/` on the host:
+
+```
+whisperx/data/out/<job_id>/
+├── transcript.txt    # Speaker-labeled text
+├── transcript.srt    # Subtitles
+└── result.json       # Segments + word-level timestamps + speaker map
+```
+
+---
+
+## Configuration (compose `environment`)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `WHISPER_MODEL` | `large-v3` | `large-v3-turbo` is ~4× faster, slightly less accurate |
+| `COMPUTE_TYPE` | `float16` | Use `int8` to cut VRAM if needed |
+| `DEFAULT_LANGUAGE` | `en` | Empty string = auto-detect |
+| `BATCH_SIZE` | `16` | Lower if you hit out-of-memory |
+| `device_ids` | `["1"]` | Change in the compose file to move GPUs |
+
+---
+
+## Build notes (Blackwell / RTX PRO 6000)
+
+The image pins a few versions that WhisperX 3.4.2 would otherwise get wrong on
+this hardware. These are already handled in the `Dockerfile`:
+
+- **`ctranslate2==4.8.0`** — whisperx pins `ctranslate2<4.5.0`, but 4.4.0 links
+  **cuDNN 8** while this CUDA 12.8 image (and Blackwell) needs the **cuDNN 9**
+  build. Symptom if wrong: container crashes/restarts mid-`transcribe` with
+  `Could not load library libcudnn_ops_infer.so.8`.
+- **`huggingface_hub==0.34.4` + `transformers==4.48.3`** — newer `huggingface_hub`
+  (1.x) removed the `use_auth_token` argument that `pyannote.audio` 3.4 still
+  uses. Symptom if wrong: `hf_hub_download() got an unexpected keyword argument
+  'use_auth_token'` in the `diarize` stage.
+- **`torch.load` weights_only patch** (in `server.py`) — PyTorch ≥ 2.6 defaults
+  `weights_only=True`, which blocks loading the pyannote/lightning checkpoints.
+  Symptom if missing: `Weights only load failed`.
+
+First successful run took ~57 s for a short clip (models loading); subsequent
+runs are a few seconds once the models are warm in memory.
+
+## Troubleshooting
+
+- **`diarization: false` in `/health`** — the HF token didn't reach the
+  container, or the pyannote licenses weren't accepted. Check `.env` and the
+  license pages above.
+- **GPU / kernel errors at runtime on the RTX PRO 6000 (Blackwell)** — the
+  image is built for CUDA 12.8 + cuDNN 9. If CTranslate2 complains about the
+  compute capability, try `COMPUTE_TYPE=int8`, or bump the `ctranslate2`
+  version. Share the error and it can be adjusted.
+- **Out of memory** — lower `BATCH_SIZE`, set `COMPUTE_TYPE=int8`, or use a
+  smaller `WHISPER_MODEL`.
+- **`pip resolution-too-deep` during build** — already handled: deps are
+  installed in stages with a torch constraints file. If you bump WhisperX and it
+  recurs, keep the staged install pattern.
+- **First request hangs for a while** — it's downloading models. Watch
+  `docker compose -f docker-compose-whisperx.yml logs -f`.

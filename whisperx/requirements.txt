@@ -1,0 +1,4 @@
+# whisperx pulls its own pinned deps (faster-whisper, ctranslate2, pyannote,
+# transformers, pandas, nltk). A constraints file in the Dockerfile keeps it
+# from downgrading the base image's Blackwell-capable torch.
+whisperx==3.4.2

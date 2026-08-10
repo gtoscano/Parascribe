@@ -1,0 +1,4 @@
+concurrency,jobs_ok,jobs_failed,wall_s,lat_min_s,lat_mean_s,lat_max_s,server_proc_mean_s,gpu_peak_mem_MiB,gpu_mem_over_idle_MiB,gpu_mean_util_pct,gpu_peak_util_pct,gpu_busy_s,host_ram_peak_GiB,files_per_min,realtime_factor
+1,1,0,10.1,10.1,10.1,10.1,8.9,17816,3584,39.1,89,4.0,15.82,5.94,47.3
+2,2,0,28.2,28.2,28.2,28.2,27.5,21560,7328,32.0,100,9.0,15.9,4.25,33.87
+4,4,0,56.4,28.3,42.4,56.4,27.3,24376,10144,30.4,100,17.2,15.92,4.25,33.89
