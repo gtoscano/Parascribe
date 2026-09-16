@@ -17,11 +17,13 @@ Endpoints:
   GET  /v1/jobs/{job_id}/transcript.txt
   GET  /v1/jobs/{job_id}/transcript.srt
   GET  /v1/jobs/{job_id}/result.json
+  GET  /v1/jobs/{job_id}/timings.json
 """
 import asyncio
 import json
 import os
 import shutil
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -183,7 +185,17 @@ def _to_srt(segments) -> str:
     return "\n".join(out)
 
 
+def _timed(job: Dict[str, Any], name: str, func, *args, **kwargs):
+    """Run ``func`` and retain its wall-clock duration, including on failure."""
+    started = time.perf_counter()
+    try:
+        return func(*args, **kwargs)
+    finally:
+        job["timings"][name] = round(time.perf_counter() - started, 6)
+
+
 def run_transcription(job: Dict[str, Any], models: "ModelSet"):
+    pipeline_started = time.perf_counter()
     audio_path = job["audio_path"]
     language = job.get("language") or DEFAULT_LANGUAGE
     do_diarize = job.get("diarize", True)
@@ -193,23 +205,28 @@ def run_transcription(job: Dict[str, Any], models: "ModelSet"):
 
     # No lock: each worker owns `models`, so its GPU work runs concurrently
     # with other workers but never touches another worker's models.
-    audio = whisperx.load_audio(audio_path)
+    job["stage"] = "load_audio"
+    audio = _timed(job, "load_audio_s", whisperx.load_audio, audio_path)
 
     job["stage"] = "transcribe"
-    asr = models.get_asr()
-    result = asr.transcribe(audio, batch_size=BATCH_SIZE,
-                            language=language if language else None)
+    asr = _timed(job, "prepare_asr_model_s", models.get_asr)
+    result = _timed(
+        job, "transcribe_s", asr.transcribe, audio,
+        batch_size=BATCH_SIZE, language=language if language else None)
     lang = result.get("language", language or DEFAULT_LANGUAGE)
 
     job["stage"] = "align"
-    model_a, metadata = models.get_align(lang)
-    result = whisperx.align(result["segments"], model_a, metadata, audio,
-                            DEVICE, return_char_alignments=False)
+    model_a, metadata = _timed(
+        job, "prepare_align_model_s", models.get_align, lang)
+    result = _timed(
+        job, "align_s", whisperx.align, result["segments"], model_a,
+        metadata, audio, DEVICE, return_char_alignments=False)
 
     speaker_map = {}
     if do_diarize:
         job["stage"] = "diarize"
-        diarize_model = models.get_diarize()
+        diarize_model = _timed(
+            job, "prepare_diarize_model_s", models.get_diarize)
         dia_kwargs = {}
         if num_spk:
             dia_kwargs["num_speakers"] = num_spk
@@ -217,30 +234,54 @@ def run_transcription(job: Dict[str, Any], models: "ModelSet"):
             dia_kwargs["min_speakers"] = min_spk
         if max_spk:
             dia_kwargs["max_speakers"] = max_spk
-        diarize_segments = diarize_model(audio, **dia_kwargs)
-        result = whisperx.assign_word_speakers(diarize_segments, result)
-        speaker_map = _relabel_speakers(result["segments"])
+        diarize_segments = _timed(
+            job, "diarize_s", diarize_model, audio, **dia_kwargs)
+
+        def assign_speakers():
+            assigned = whisperx.assign_word_speakers(diarize_segments, result)
+            mapping = _relabel_speakers(assigned["segments"])
+            return assigned, mapping
+
+        result, speaker_map = _timed(
+            job, "assign_speakers_s", assign_speakers)
     else:
+        job["timings"].update({
+            "prepare_diarize_model_s": 0.0,
+            "diarize_s": 0.0,
+            "assign_speakers_s": 0.0,
+        })
         for seg in result["segments"]:
             seg["speaker_label"] = "Speaker ?"
 
-    segments = result["segments"]
-    full = {
-        "language": lang,
-        "num_speakers": len(speaker_map),
-        "speaker_map": speaker_map,
-        "segments": segments,
-        "text": _to_txt(segments),
-    }
+    job["stage"] = "format_outputs"
+
+    def format_outputs():
+        segments = result["segments"]
+        full = {
+            "language": lang,
+            "num_speakers": len(speaker_map),
+            "speaker_map": speaker_map,
+            "segments": segments,
+            "text": _to_txt(segments),
+        }
+        return full, _to_srt(segments)
+
+    full, srt = _timed(job, "format_outputs_s", format_outputs)
 
     out_dir = OUT_DIR / job["job_id"]
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "result.json").write_text(json.dumps(full, ensure_ascii=False, indent=2))
-    (out_dir / "transcript.txt").write_text(full["text"])
-    (out_dir / "transcript.srt").write_text(_to_srt(segments))
+
+    def write_outputs():
+        (out_dir / "transcript.txt").write_text(full["text"])
+        (out_dir / "transcript.srt").write_text(srt)
+
+    job["stage"] = "write_outputs"
+    _timed(job, "write_outputs_s", write_outputs)
 
     job["result"] = full
     job["out_dir"] = str(out_dir)
+    job["timings"]["pipeline_s"] = round(
+        time.perf_counter() - pipeline_started, 6)
 
 
 # ----------------------------------------------------------------------------
@@ -261,6 +302,43 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _timing_document(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Serializable timing record written for successful and failed jobs."""
+    timestamps = {
+        key: job[key]
+        for key in ("received_at", "uploaded_at", "created_at", "queued_at",
+                    "started_at", "finished_at")
+        if job.get(key)
+    }
+    return {
+        "schema_version": 1,
+        "job_id": job["job_id"],
+        "filename": job.get("filename"),
+        "status": job.get("status"),
+        "stage": job.get("stage"),
+        "worker": job.get("worker"),
+        "replica_id": REPLICA_ID,
+        "timestamps": timestamps,
+        "durations_s": dict(job.get("timings", {})),
+    }
+
+
+def _persist_job(job: Dict[str, Any]):
+    """Persist final result and timing metadata in the job output directory."""
+    out_dir = OUT_DIR / job["job_id"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timing_document = _timing_document(job)
+    (out_dir / "timings.json").write_text(
+        json.dumps(timing_document, ensure_ascii=False, indent=2))
+    if job.get("result"):
+        result = dict(job["result"])
+        result["job_id"] = job["job_id"]
+        result["timestamps"] = timing_document["timestamps"]
+        result["timings"] = timing_document["durations_s"]
+        (out_dir / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2))
+
+
 async def _worker(worker_id: int, models: "ModelSet"):
     loop = asyncio.get_running_loop()
     while True:
@@ -269,6 +347,9 @@ async def _worker(worker_id: int, models: "ModelSet"):
         if not job:
             _queue.task_done()
             continue
+        worker_started = time.perf_counter()
+        job["timings"]["queue_wait_s"] = round(
+            worker_started - job["_queued_perf"], 6)
         job["status"] = "running"
         job["worker"] = worker_id
         job["started_at"] = _now()
@@ -281,6 +362,30 @@ async def _worker(worker_id: int, models: "ModelSet"):
             job["error"] = f"{e}\n{traceback.format_exc()}"
         finally:
             job["finished_at"] = _now()
+            job["timings"]["processing_s"] = round(
+                time.perf_counter() - worker_started, 6)
+            job["timings"].setdefault(
+                "pipeline_s", job["timings"]["processing_s"])
+            persistence_started = time.perf_counter()
+            try:
+                _persist_job(job)
+                job["timings"]["persist_metadata_s"] = round(
+                    time.perf_counter() - persistence_started, 6)
+                job["timings"]["total_server_s"] = round(
+                    time.perf_counter() - job["_received_perf"], 6)
+                # Refresh both JSON documents with the final persistence and
+                # total durations. The first full write is what is measured.
+                _persist_job(job)
+            except Exception:
+                job["timings"]["persist_metadata_s"] = round(
+                    time.perf_counter() - persistence_started, 6)
+                job["timings"]["total_server_s"] = round(
+                    time.perf_counter() - job["_received_perf"], 6)
+                persistence_error = traceback.format_exc()
+                job["error"] = (job.get("error", "")
+                                + "\nFailed to persist job metadata:\n"
+                                + persistence_error).strip()
+                job["status"] = "error"
             _queue.task_done()
 
 
@@ -313,8 +418,10 @@ async def models():
 
 def _public(job: Dict[str, Any]) -> Dict[str, Any]:
     fields = ["job_id", "status", "stage", "filename", "created_at",
-              "started_at", "finished_at", "error", "num_speakers", "worker"]
+              "received_at", "uploaded_at", "queued_at", "started_at",
+              "finished_at", "error", "num_speakers", "worker"]
     out = {k: job.get(k) for k in fields if k in job}
+    out["timings"] = dict(job.get("timings", {}))
     if job.get("result"):
         out["num_speakers"] = job["result"].get("num_speakers")
         out["language"] = job["result"].get("language")
@@ -323,6 +430,9 @@ def _public(job: Dict[str, Any]) -> Dict[str, Any]:
             "srt": f"/v1/jobs/{job['job_id']}/transcript.srt",
             "json": f"/v1/jobs/{job['job_id']}/result.json",
         }
+    if job.get("finished_at"):
+        out.setdefault("links", {})["timings"] = (
+            f"/v1/jobs/{job['job_id']}/timings.json")
     return out
 
 
@@ -335,6 +445,8 @@ async def transcribe(
     min_speakers: Optional[int] = Form(None),
     max_speakers: Optional[int] = Form(None),
 ):
+    received_perf = time.perf_counter()
+    received_at = _now()
     if diarize and not HF_TOKEN:
         raise HTTPException(400, "Diarization requested but HF_TOKEN is not set. "
                                  "Set it in .env and accept the pyannote license.")
@@ -343,8 +455,15 @@ async def transcribe(
     job_id = f"{REPLICA_ID}-{uuid.uuid4().hex[:12]}"
     suffix = Path(file.filename or "audio").suffix or ".wav"
     audio_path = IN_DIR / f"{job_id}{suffix}"
-    with audio_path.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
+    upload_save_started = time.perf_counter()
+    try:
+        with audio_path.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+    finally:
+        upload_save_s = round(time.perf_counter() - upload_save_started, 6)
+    uploaded_at = _now()
+    queued_perf = time.perf_counter()
+    queued_at = _now()
 
     job = {
         "job_id": job_id,
@@ -357,7 +476,13 @@ async def transcribe(
         "num_speakers": num_speakers,
         "min_speakers": min_speakers,
         "max_speakers": max_speakers,
-        "created_at": _now(),
+        "received_at": received_at,
+        "uploaded_at": uploaded_at,
+        "created_at": received_at,
+        "queued_at": queued_at,
+        "timings": {"upload_save_s": upload_save_s},
+        "_received_perf": received_perf,
+        "_queued_perf": queued_perf,
     }
     JOBS[job_id] = job
     await _queue.put(job_id)
@@ -400,3 +525,8 @@ async def get_srt(job_id: str):
 @app.get("/v1/jobs/{job_id}/result.json")
 async def get_json(job_id: str):
     return JSONResponse(json.loads(_read_out(job_id, "result.json")))
+
+
+@app.get("/v1/jobs/{job_id}/timings.json")
+async def get_timings(job_id: str):
+    return JSONResponse(json.loads(_read_out(job_id, "timings.json")))

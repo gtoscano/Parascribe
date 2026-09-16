@@ -11,6 +11,7 @@ each concurrency level:
   * wall time            – submit first job  ->  last job done
   * per-job latency      – submit -> done, min / mean / max across the C jobs
   * server process time  – running -> finished (from the server's own timestamps)
+  * server stage time    – queue, model prep, ASR, align, diarize, and output stages
   * GPU memory           – peak MiB on the WhisperX GPU, and delta over idle
   * GPU utilization       – mean / peak %, plus estimated GPU-busy seconds
   * host RAM             – peak used GiB during the level
@@ -44,6 +45,10 @@ Usage
   # Quick smoke test (just concurrency 1)
   python3 benchmark_transcribe.py --levels 1
 
+Output:
+  The aggregate CSV passed with --out (or benchmark_<timestamp>.csv), plus a
+  companion <name>_jobs.csv containing every successful job's raw timings.
+
 Env / flags:
   WHISPERX_URL   default http://localhost:8357   (override with --url)
 """
@@ -63,6 +68,13 @@ import requests
 
 WHISPERX_URL = os.environ.get("WHISPERX_URL", "http://localhost:8357")
 DEFAULT_AUDIO = "testing_audio/dataset/ami/ES2005a.wav"  # ~478s, 4 speakers, smallest AMI
+SERVER_TIMING_KEYS = [
+    "upload_save_s", "queue_wait_s", "load_audio_s", "prepare_asr_model_s",
+    "transcribe_s", "prepare_align_model_s", "align_s",
+    "prepare_diarize_model_s", "diarize_s", "assign_speakers_s",
+    "format_outputs_s", "write_outputs_s", "pipeline_s", "processing_s",
+    "persist_metadata_s", "total_server_s",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +189,7 @@ def submit_and_wait(audio_path: Path, num_speakers, language, diarize,
         "url": base_url,                 # which replica handled it
         "latency": t_done - t_submit,    # client-observed submit->done
         "server_proc": proc,             # server running->finished
+        "server_timings": dict(j.get("timings", {})),
         "num_speakers": j.get("num_speakers"),
         "t_submit": t_submit,
         "t_done": t_done,
@@ -229,11 +242,18 @@ def run_level(concurrency, audio_path, audio_dur, args, sampler, idle_mem, urls)
         "concurrency": concurrency,
         "jobs_ok": n_ok,
         "jobs_failed": len(errors),
-        "wall_s": round(wall, 1),
-        "lat_min_s": round(min(lat), 1) if lat else "",
-        "lat_mean_s": round(statistics.mean(lat), 1) if lat else "",
-        "lat_max_s": round(max(lat), 1) if lat else "",
-        "server_proc_mean_s": round(statistics.mean(proc), 1) if proc else "",
+        "wall_s": round(wall, 3),
+        "lat_min_s": round(min(lat), 3) if lat else "",
+        "lat_mean_s": round(statistics.mean(lat), 3) if lat else "",
+        "lat_max_s": round(max(lat), 3) if lat else "",
+        "server_proc_mean_s": round(statistics.mean(proc), 3) if proc else "",
+    }
+    for key in SERVER_TIMING_KEYS:
+        values = [r["server_timings"][key] for r in results
+                  if key in r["server_timings"]]
+        row[f"server_{key.removesuffix('_s')}_mean_s"] = (
+            round(statistics.mean(values), 6) if values else "")
+    row.update({
         "gpu_peak_mem_MiB": round(peak_mem) if peak_mem == peak_mem else "",
         "gpu_mem_over_idle_MiB": round(peak_mem - idle_mem) if peak_mem == peak_mem else "",
         "gpu_mean_util_pct": round(mean_util, 1) if mean_util == mean_util else "",
@@ -242,14 +262,30 @@ def run_level(concurrency, audio_path, audio_dur, args, sampler, idle_mem, urls)
         "host_ram_peak_GiB": round(peak_ram, 2) if peak_ram == peak_ram else "",
         "files_per_min": round(files_per_min, 2) if files_per_min == files_per_min else "",
         "realtime_factor": round(rtf, 2) if rtf == rtf else "",
-    }
+    })
+
+    job_rows = []
+    for result in results:
+        job_row = {
+            "concurrency": concurrency,
+            "job_id": result["job_id"],
+            "url": result["url"],
+            "client_latency_s": round(result["latency"], 6),
+            "server_proc_s": (round(result["server_proc"], 6)
+                              if result["server_proc"] == result["server_proc"]
+                              else ""),
+            "num_speakers": result["num_speakers"],
+        }
+        for key in SERVER_TIMING_KEYS:
+            job_row[key] = result["server_timings"].get(key, "")
+        job_rows.append(job_row)
 
     print(f"  wall={row['wall_s']}s  peak_gpu_mem={row['gpu_peak_mem_MiB']}MiB "
           f"(+{row['gpu_mem_over_idle_MiB']} over idle)  "
           f"mean_util={row['gpu_mean_util_pct']}%  "
           f"host_ram_peak={row['host_ram_peak_GiB']}GiB  "
           f"throughput={row['files_per_min']} files/min  RTF={row['realtime_factor']}x")
-    return row
+    return row, job_rows
 
 
 def main():
@@ -345,11 +381,13 @@ def main():
                 except Exception as e:
                     print(f"  warmup failed [{u}] (continuing): {e}")
 
-    rows = []
+    rows, job_rows = [], []
     try:
         for i, c in enumerate(levels):
-            rows.append(run_level(c, audio_path, audio_dur, args, sampler,
-                                  idle_mem, urls))
+            level_row, level_jobs = run_level(
+                c, audio_path, audio_dur, args, sampler, idle_mem, urls)
+            rows.append(level_row)
+            job_rows.extend(level_jobs)
             if i < len(levels) - 1 and args.cooldown:
                 time.sleep(args.cooldown)
     except KeyboardInterrupt:
@@ -367,8 +405,18 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
+    jobs_out_path = out_path.with_name(
+        f"{out_path.stem}_jobs{out_path.suffix or '.csv'}")
+    if job_rows:
+        with jobs_out_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(job_rows[0].keys()))
+            w.writeheader()
+            w.writerows(job_rows)
+
     _print_summary(rows, audio_dur, idle_mem)
-    print(f"\nCSV written: {out_path}")
+    print(f"\nAggregate CSV written: {out_path}")
+    if job_rows:
+        print(f"Per-job CSV written  : {jobs_out_path}")
 
 
 def _duration_from_manifest(audio_path: Path):

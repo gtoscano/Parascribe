@@ -100,12 +100,20 @@ python3 transcribe.py meeting.m4a --num-speakers 3
 python3 transcribe.py *.m4a --num-speakers 8 --concurrency 3
 ```
 
+Every processed file also gets a `<file>.timings.json` sidecar. It records
+client-observed upload, polling, download, local writes, optional summarization,
+and total time, plus the server's queue and WhisperX stage durations. Server
+copies are retained at `/data/out/<job_id>/timings.json`.
+
 ### Benchmark
 
 ```bash
 python3 benchmark_transcribe.py --url http://localhost:8357 \
     --audio your_audio.wav --levels 1,3,10 --num-speakers 4 --warmup
 ```
+
+The benchmark writes an aggregate CSV and a companion `_jobs.csv` containing
+every individual job's raw client and server-stage timings.
 
 ---
 

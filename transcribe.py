@@ -37,9 +37,11 @@ Endpoints (override with env or flags):
   VLLM_URL       default http://localhost:8355   (your Qwen3 general model)
 """
 import argparse
+import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -63,89 +65,224 @@ Transcript:
 """
 
 
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _new_stats(source_path, operation, base_url=None):
+    source_path = Path(source_path)
+    stats = {
+        "schema_version": 1,
+        "operation": operation,
+        "source_file": str(source_path),
+        "status": "running",
+        "started_at": _utc_now(),
+        "client": {"durations_s": {}},
+    }
+    if source_path.exists():
+        stats["source_bytes"] = source_path.stat().st_size
+    if base_url:
+        stats["server_url"] = base_url
+    return stats
+
+
+def _stats_path(source_path):
+    return Path(f"{source_path}.timings.json")
+
+
+def _save_stats(source_path, stats):
+    out = _stats_path(source_path)
+    out.write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n")
+    return out
+
+
+def _capture_server_stats(stats, job):
+    stats["job_id"] = job.get("job_id", stats.get("job_id"))
+    stats["server"] = {
+        "timestamps": {
+            key: job[key]
+            for key in ("received_at", "uploaded_at", "created_at", "queued_at",
+                        "started_at", "finished_at")
+            if job.get(key)
+        },
+        "durations_s": dict(job.get("timings", {})),
+    }
+
+
 def transcribe(audio_path, base_url, language="en", diarize=True,
                num_speakers=None, min_speakers=None, max_speakers=None,
-               poll=5, timeout=7200, tag=""):
-    """Transcribe one file on `base_url`. The whole job (submit + poll + fetch)
-    stays on that one replica, because the /v1/jobs registry is per-process."""
+               poll=5, timeout=7200, tag="", stats=None):
+    """Transcribe one file and add client/server timings to ``stats``."""
     pfx = f"[{tag}] " if tag else ""
     audio_path = Path(audio_path)
     if not audio_path.exists():
         raise FileNotFoundError(f"File not found: {audio_path}")
 
-    print(f"{pfx}→ Uploading {audio_path.name} to {base_url} ...")
-    data = {"language": language, "diarize": str(diarize).lower()}
-    for k, v in (("num_speakers", num_speakers),
-                 ("min_speakers", min_speakers),
-                 ("max_speakers", max_speakers)):
-        if v:
-            data[k] = v
-    with audio_path.open("rb") as f:
-        r = requests.post(f"{base_url}/v1/transcribe",
-                          files={"file": (audio_path.name, f)}, data=data)
-    r.raise_for_status()
-    job_id = r.json()["job_id"]
-    print(f"{pfx}  job_id = {job_id}")
+    stats = stats if stats is not None else _new_stats(
+        audio_path, "transcribe", base_url)
+    durations = stats.setdefault("client", {}).setdefault("durations_s", {})
+    transcription_started = time.perf_counter()
+    wait_started = None
+    polls = 0
+    try:
+        print(f"{pfx}→ Uploading {audio_path.name} to {base_url} ...")
+        data = {"language": language, "diarize": str(diarize).lower()}
+        for k, v in (("num_speakers", num_speakers),
+                     ("min_speakers", min_speakers),
+                     ("max_speakers", max_speakers)):
+            if v:
+                data[k] = v
 
-    start = time.time()
-    last_stage = None
-    while True:
-        j = requests.get(f"{base_url}/v1/jobs/{job_id}").json()
-        status, stage = j.get("status"), j.get("stage")
-        if stage != last_stage:
-            print(f"{pfx}  [{int(time.time()-start)}s] {status} / {stage}")
-            last_stage = stage
-        if status == "done":
-            break
-        if status == "error":
-            raise RuntimeError("Transcription failed:\n"
-                               + j.get("error", "unknown error"))
-        if time.time() - start > timeout:
-            raise TimeoutError("Timed out waiting for transcription.")
-        time.sleep(poll)
+        upload_started = time.perf_counter()
+        try:
+            with audio_path.open("rb") as f:
+                response = requests.post(
+                    f"{base_url}/v1/transcribe",
+                    files={"file": (audio_path.name, f)}, data=data)
+        finally:
+            durations["upload_http_s"] = round(
+                time.perf_counter() - upload_started, 6)
+        response.raise_for_status()
+        job_id = response.json()["job_id"]
+        stats["job_id"] = job_id
+        print(f"{pfx}  job_id = {job_id}")
 
-    text = requests.get(f"{base_url}/v1/jobs/{job_id}/transcript.txt").text
-    out_txt = audio_path.with_suffix(".transcript.txt")
-    out_txt.write_text(text)
-    print(f"{pfx}✓ Transcript saved: {out_txt}  "
-          f"({j.get('num_speakers', '?')} speakers detected)")
-    return text, out_txt
+        wait_started = time.perf_counter()
+        last_stage = None
+        while True:
+            status_started = time.perf_counter()
+            response = requests.get(f"{base_url}/v1/jobs/{job_id}")
+            durations["status_requests_s"] = round(
+                durations.get("status_requests_s", 0.0)
+                + time.perf_counter() - status_started, 6)
+            polls += 1
+            response.raise_for_status()
+            job = response.json()
+            _capture_server_stats(stats, job)
+            status, stage = job.get("status"), job.get("stage")
+            if stage != last_stage:
+                print(f"{pfx}  [{int(time.perf_counter()-wait_started)}s] "
+                      f"{status} / {stage}")
+                last_stage = stage
+            if status == "done":
+                break
+            if status == "error":
+                raise RuntimeError("Transcription failed:\n"
+                                   + job.get("error", "unknown error"))
+            if time.perf_counter() - wait_started > timeout:
+                raise TimeoutError("Timed out waiting for transcription.")
+            time.sleep(poll)
+        durations["wait_until_done_s"] = round(
+            time.perf_counter() - wait_started, 6)
+        stats["client"]["status_requests"] = polls
+
+        download_started = time.perf_counter()
+        try:
+            response = requests.get(
+                f"{base_url}/v1/jobs/{job_id}/transcript.txt")
+            response.raise_for_status()
+            text = response.text
+        finally:
+            durations["transcript_download_s"] = round(
+                time.perf_counter() - download_started, 6)
+
+        out_txt = audio_path.with_suffix(".transcript.txt")
+        write_started = time.perf_counter()
+        try:
+            out_txt.write_text(text)
+        finally:
+            durations["transcript_write_s"] = round(
+                time.perf_counter() - write_started, 6)
+        print(f"{pfx}✓ Transcript saved: {out_txt}  "
+              f"({job.get('num_speakers', '?')} speakers detected)")
+        return text, out_txt
+    finally:
+        if wait_started is not None:
+            durations["wait_until_terminal_s"] = round(
+                time.perf_counter() - wait_started, 6)
+            stats["client"]["status_requests"] = polls
+        durations["transcription_total_s"] = round(
+            time.perf_counter() - transcription_started, 6)
 
 
-def summarize(transcript, vllm_url, max_tokens=2048, tag=""):
+def summarize(transcript, vllm_url, max_tokens=2048, tag="", stats=None):
     pfx = f"[{tag}] " if tag else ""
-    # auto-detect the served model id
-    model = requests.get(f"{vllm_url}/v1/models").json()["data"][0]["id"]
-    print(f"{pfx}→ Summarizing with {model} at {vllm_url} ...")
-    payload = {
-        "model": model,
-        "messages": [{"role": "user",
-                      "content": SUMMARY_PROMPT.format(transcript=transcript)}],
-        "temperature": 0.3,
-        "max_tokens": max_tokens,
-    }
-    r = requests.post(f"{vllm_url}/v1/chat/completions", json=payload, timeout=600)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    durations = (stats if stats is not None else {}).setdefault(
+        "client", {}).setdefault("durations_s", {})
+    summarize_started = time.perf_counter()
+    try:
+        model_started = time.perf_counter()
+        try:
+            response = requests.get(f"{vllm_url}/v1/models")
+            response.raise_for_status()
+            model = response.json()["data"][0]["id"]
+        finally:
+            durations["summary_model_lookup_s"] = round(
+                time.perf_counter() - model_started, 6)
+        if stats is not None:
+            stats["summary_model"] = model
+            stats["summary_server_url"] = vllm_url
+        print(f"{pfx}→ Summarizing with {model} at {vllm_url} ...")
+        payload = {
+            "model": model,
+            "messages": [{"role": "user",
+                          "content": SUMMARY_PROMPT.format(transcript=transcript)}],
+            "temperature": 0.3,
+            "max_tokens": max_tokens,
+        }
+        inference_started = time.perf_counter()
+        try:
+            response = requests.post(
+                f"{vllm_url}/v1/chat/completions", json=payload, timeout=600)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        finally:
+            durations["summary_inference_http_s"] = round(
+                time.perf_counter() - inference_started, 6)
+    finally:
+        durations["summarization_total_s"] = round(
+            time.perf_counter() - summarize_started, 6)
 
 
 def process_one(audio, base_url, args, tag="", print_summary=False):
-    """Full pipeline for one file: transcribe, then optionally summarize."""
+    """Full pipeline for one file; always save a timing sidecar."""
     pfx = f"[{tag}] " if tag else ""
-    text, out_txt = transcribe(
-        audio, base_url, language=args.language, diarize=not args.no_diarize,
-        num_speakers=args.num_speakers, min_speakers=args.min_speakers,
-        max_speakers=args.max_speakers, tag=tag)
-    summary_out = None
-    if args.summarize:
-        summary = summarize(text, args.vllm_url, tag=tag)
-        summary_out = Path(audio).with_suffix(".summary.md")
-        summary_out.write_text(summary)
-        if print_summary:
-            print("\n" + "=" * 60 + "\nSUMMARY\n" + "=" * 60)
-            print(summary)
-        print(f"{pfx}✓ Summary saved: {summary_out}")
-    return audio, out_txt, summary_out
+    stats = _new_stats(
+        audio, "transcribe_and_summarize" if args.summarize else "transcribe",
+        base_url)
+    overall_started = time.perf_counter()
+    try:
+        text, out_txt = transcribe(
+            audio, base_url, language=args.language,
+            diarize=not args.no_diarize, num_speakers=args.num_speakers,
+            min_speakers=args.min_speakers, max_speakers=args.max_speakers,
+            tag=tag, stats=stats)
+        summary_out = None
+        if args.summarize:
+            summary = summarize(text, args.vllm_url, tag=tag, stats=stats)
+            summary_out = Path(audio).with_suffix(".summary.md")
+            write_started = time.perf_counter()
+            try:
+                summary_out.write_text(summary)
+            finally:
+                stats["client"]["durations_s"]["summary_write_s"] = round(
+                    time.perf_counter() - write_started, 6)
+            if print_summary:
+                print("\n" + "=" * 60 + "\nSUMMARY\n" + "=" * 60)
+                print(summary)
+            print(f"{pfx}✓ Summary saved: {summary_out}")
+        stats["status"] = "done"
+        return audio, out_txt, summary_out
+    except Exception as exc:
+        stats["status"] = "error"
+        stats["error"] = str(exc)
+        raise
+    finally:
+        stats["finished_at"] = _utc_now()
+        stats["client"]["durations_s"]["overall_s"] = round(
+            time.perf_counter() - overall_started, 6)
+        timing_out = _save_stats(audio, stats)
+        print(f"{pfx}  Timings saved: {timing_out}")
 
 
 def resolve_urls(args):
@@ -239,13 +376,32 @@ def main():
 
     # Summarize-only path (no transcription).
     if args.summarize_file:
-        text = Path(args.summarize_file).read_text()
-        summary = summarize(text, args.vllm_url)
-        out = Path(args.summarize_file).with_suffix(".summary.md")
-        out.write_text(summary)
-        print("\n" + "=" * 60 + "\nSUMMARY\n" + "=" * 60)
-        print(summary)
-        print(f"\n✓ Summary saved: {out}")
+        stats = _new_stats(args.summarize_file, "summarize")
+        overall_started = time.perf_counter()
+        try:
+            text = Path(args.summarize_file).read_text()
+            summary = summarize(text, args.vllm_url, stats=stats)
+            out = Path(args.summarize_file).with_suffix(".summary.md")
+            write_started = time.perf_counter()
+            try:
+                out.write_text(summary)
+            finally:
+                stats["client"]["durations_s"]["summary_write_s"] = round(
+                    time.perf_counter() - write_started, 6)
+            stats["status"] = "done"
+            print("\n" + "=" * 60 + "\nSUMMARY\n" + "=" * 60)
+            print(summary)
+            print(f"\n✓ Summary saved: {out}")
+        except Exception as exc:
+            stats["status"] = "error"
+            stats["error"] = str(exc)
+            raise
+        finally:
+            stats["finished_at"] = _utc_now()
+            stats["client"]["durations_s"]["overall_s"] = round(
+                time.perf_counter() - overall_started, 6)
+            timing_out = _save_stats(args.summarize_file, stats)
+            print(f"  Timings saved: {timing_out}")
         return
 
     if not args.audio:

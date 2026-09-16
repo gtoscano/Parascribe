@@ -145,6 +145,8 @@ def run_transcription(url, audio, num_speakers=None, min_speakers=None,
     txt = requests.get(f"{url}/v1/jobs/{job_id}/transcript.txt", timeout=30).text
     srt = requests.get(f"{url}/v1/jobs/{job_id}/transcript.srt", timeout=30).text
     res = requests.get(f"{url}/v1/jobs/{job_id}/result.json", timeout=30).json()
+    timing = requests.get(
+        f"{url}/v1/jobs/{job_id}/timings.json", timeout=30).json()
 
     print(f"\n--- transcript.txt ---\n{txt.strip()}\n----------------------")
 
@@ -166,6 +168,23 @@ def run_transcription(url, audio, num_speakers=None, min_speakers=None,
               f"language={res.get('language')}")
     if srt.strip():
         print(f"{PASS} SRT generated")
+
+    required_timings = {
+        "upload_save_s", "queue_wait_s", "load_audio_s", "transcribe_s",
+        "align_s", "format_outputs_s", "write_outputs_s", "pipeline_s",
+        "processing_s", "persist_metadata_s", "total_server_s",
+    }
+    durations = timing.get("durations_s", {})
+    missing = sorted(required_timings - durations.keys())
+    if missing:
+        print(f"{FAIL} timings.json missing: {', '.join(missing)}")
+        ok = False
+    elif res.get("timings") != durations or j.get("timings") != durations:
+        print(f"{FAIL} timing data differs across status/result/timings endpoints")
+        ok = False
+    else:
+        print(f"{PASS} persisted {len(durations)} timing measurements "
+              f"(server total {durations['total_server_s']:.3f}s)")
 
     print(f"\nTook {time.time()-t0:.1f}s total")
     return ok

@@ -1,16 +1,16 @@
 id,source,style,num_speakers,duration_sec,audio_path,transcript_json_path,transcript_txt_path,license
-2000.99-1978-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2000.99-1978-t01.wav,dataset/oyez/2000.99-1978-t01.transcript.json,dataset/oyez/2000.99-1978-t01.txt,"CC-BY-NC (Oyez, Inc.)"
-2002.01-1243-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2002.01-1243-t01.wav,dataset/oyez/2002.01-1243-t01.transcript.json,dataset/oyez/2002.01-1243-t01.txt,"CC-BY-NC (Oyez, Inc.)"
+2000.105_orig-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2000.105_orig-t01.wav,dataset/oyez/2000.105_orig-t01.transcript.json,dataset/oyez/2000.105_orig-t01.txt,"CC-BY-NC (Oyez, Inc.)"
 2002.01-1559-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2002.01-1559-t01.wav,dataset/oyez/2002.01-1559-t01.transcript.json,dataset/oyez/2002.01-1559-t01.txt,"CC-BY-NC (Oyez, Inc.)"
-2004.04-108-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2004.04-108-t01.wav,dataset/oyez/2004.04-108-t01.transcript.json,dataset/oyez/2004.04-108-t01.txt,"CC-BY-NC (Oyez, Inc.)"
-2006.06-102-t01,oyez,structured_one_at_a_time,8,2323.3,dataset/oyez/2006.06-102-t01.wav,dataset/oyez/2006.06-102-t01.transcript.json,dataset/oyez/2006.06-102-t01.txt,"CC-BY-NC (Oyez, Inc.)"
-2008.07-615-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2008.07-615-t01.wav,dataset/oyez/2008.07-615-t01.transcript.json,dataset/oyez/2008.07-615-t01.txt,"CC-BY-NC (Oyez, Inc.)"
-2010.09-837-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2010.09-837-t01.wav,dataset/oyez/2010.09-837-t01.transcript.json,dataset/oyez/2010.09-837-t01.txt,"CC-BY-NC (Oyez, Inc.)"
-2010.09-846-t01,oyez,structured_one_at_a_time,8,2138.1,dataset/oyez/2010.09-846-t01.wav,dataset/oyez/2010.09-846-t01.transcript.json,dataset/oyez/2010.09-846-t01.txt,"CC-BY-NC (Oyez, Inc.)"
+2004.03-1293-t01,oyez,structured_one_at_a_time,8,2366.2,dataset/oyez/2004.03-1293-t01.wav,dataset/oyez/2004.03-1293-t01.transcript.json,dataset/oyez/2004.03-1293-t01.txt,"CC-BY-NC (Oyez, Inc.)"
+2009.08-1008-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2009.08-1008-t01.wav,dataset/oyez/2009.08-1008-t01.transcript.json,dataset/oyez/2009.08-1008-t01.txt,"CC-BY-NC (Oyez, Inc.)"
+2009.08-1107-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2009.08-1107-t01.wav,dataset/oyez/2009.08-1107-t01.transcript.json,dataset/oyez/2009.08-1107-t01.txt,"CC-BY-NC (Oyez, Inc.)"
+2009.08-1569-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2009.08-1569-t01.wav,dataset/oyez/2009.08-1569-t01.transcript.json,dataset/oyez/2009.08-1569-t01.txt,"CC-BY-NC (Oyez, Inc.)"
+2010.09-846-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2010.09-846-t01.wav,dataset/oyez/2010.09-846-t01.transcript.json,dataset/oyez/2010.09-846-t01.txt,"CC-BY-NC (Oyez, Inc.)"
 2013.12-1163-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2013.12-1163-t01.wav,dataset/oyez/2013.12-1163-t01.transcript.json,dataset/oyez/2013.12-1163-t01.txt,"CC-BY-NC (Oyez, Inc.)"
 2013.13-339-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2013.13-339-t01.wav,dataset/oyez/2013.13-339-t01.transcript.json,dataset/oyez/2013.13-339-t01.txt,"CC-BY-NC (Oyez, Inc.)"
-2015.14-6166-t01,oyez,structured_one_at_a_time,8,2383.9,dataset/oyez/2015.14-6166-t01.wav,dataset/oyez/2015.14-6166-t01.transcript.json,dataset/oyez/2015.14-6166-t01.txt,"CC-BY-NC (Oyez, Inc.)"
-2016.15-927-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2016.15-927-t01.wav,dataset/oyez/2016.15-927-t01.transcript.json,dataset/oyez/2016.15-927-t01.txt,"CC-BY-NC (Oyez, Inc.)"
+2015.14-844-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2015.14-844-t01.wav,dataset/oyez/2015.14-844-t01.transcript.json,dataset/oyez/2015.14-844-t01.txt,"CC-BY-NC (Oyez, Inc.)"
+2016.15-1358-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2016.15-1358-t01.wav,dataset/oyez/2016.15-1358-t01.transcript.json,dataset/oyez/2016.15-1358-t01.txt,"CC-BY-NC (Oyez, Inc.)"
+2016.15-7250-t01,oyez,structured_one_at_a_time,8,2400.0,dataset/oyez/2016.15-7250-t01.wav,dataset/oyez/2016.15-7250-t01.transcript.json,dataset/oyez/2016.15-7250-t01.txt,"CC-BY-NC (Oyez, Inc.)"
 ES2002a,AMI,general_dialogue,4,1272.6,dataset/ami/ES2002a.wav,dataset/ami/ES2002a.transcript.json,dataset/ami/ES2002a.txt,CC BY 4.0
 ES2002b,AMI,general_dialogue,4,2279.8,dataset/ami/ES2002b.wav,dataset/ami/ES2002b.transcript.json,dataset/ami/ES2002b.txt,CC BY 4.0
 ES2003a,AMI,general_dialogue,4,1139.8,dataset/ami/ES2003a.wav,dataset/ami/ES2003a.transcript.json,dataset/ami/ES2003a.txt,CC BY 4.0

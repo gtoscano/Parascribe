@@ -167,7 +167,8 @@ Base URL: `http://192.168.2.101:8357`
 | `GET /v1/jobs/{id}` | Job status + result when done |
 | `GET /v1/jobs/{id}/transcript.txt` | Speaker-labeled plain text |
 | `GET /v1/jobs/{id}/transcript.srt` | Subtitles with speaker tags |
-| `GET /v1/jobs/{id}/result.json` | Full result: segments, word timestamps, speaker map |
+| `GET /v1/jobs/{id}/result.json` | Full result: segments, word timestamps, speaker map, timings |
+| `GET /v1/jobs/{id}/timings.json` | Persisted timestamps and per-stage durations |
 
 `POST /v1/transcribe` form fields:
 
@@ -197,6 +198,17 @@ curl -s http://192.168.2.101:8357/v1/jobs/abc123/transcript.txt
 Jobs run **one at a time** (the GPU processes serially); submit many and poll
 each `job_id`.
 
+Every job status response includes a `timings` object whose values are seconds.
+It separates upload-to-disk, queue wait, audio loading, lazy/cached model
+preparation, transcription, alignment, diarization, speaker assignment, output
+formatting/writes, the complete pipeline, worker processing, and total server
+time. Failed jobs retain all measurements completed before the failure.
+
+`prepare_*_model_s` includes lazy model loading on a replica's first job; on
+later jobs it measures the cached lookup. The client additionally writes a
+`<file>.timings.json` sidecar with HTTP upload/download, polling, local output,
+optional summarization, and end-to-end durations.
+
 ---
 
 ## Retrieving transcripts as files
@@ -207,7 +219,8 @@ Every finished job also writes to `whisperx/data/out/<job_id>/` on the host:
 whisperx/data/out/<job_id>/
 ├── transcript.txt    # Speaker-labeled text
 ├── transcript.srt    # Subtitles
-└── result.json       # Segments + word-level timestamps + speaker map
+├── result.json       # Segments + word timestamps + embedded timings
+└── timings.json      # Job timestamps + all server-stage durations
 ```
 
 ---
