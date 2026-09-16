@@ -1,0 +1,13 @@
+case_json,title,duration_min,num_speakers,mp3_url
+supreme_court_transcripts/oyez/cases/2015.14-844-t01.json,"Oral Argument - November 04, 2015",50.1,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2015/14-844/14-844_20151104-argument.delivery.mp3
+supreme_court_transcripts/oyez/cases/2002.01-1559-t01.json,"Oral Argument - February 25, 2003",45.4,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2002/01-1559/20030225a_01-1559.delivery.mp3
+supreme_court_transcripts/oyez/cases/2016.15-1358-t01.json,"Oral Argument - January 18, 2017",57.5,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2016/15-1358/15-1358_20170118-argument.delivery.mp3
+supreme_court_transcripts/oyez/cases/2009.08-1008-t01.json,"Oral Argument - November 02, 2009",57.0,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2009/08-1008/20091102a_08-1008.delivery.mp3
+supreme_court_transcripts/oyez/cases/2016.15-7250-t01.json,"Oral Argument - October 11, 2016",53.7,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2016/15-7250/15-7250_20161011-argument.delivery.mp3
+supreme_court_transcripts/oyez/cases/2010.09-846-t01.json,"Oral Argument - November 01, 2010",60.2,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2010/09-846/20101101a_09-846.delivery.mp3
+supreme_court_transcripts/oyez/cases/2000.105_orig-t01.json,"Oral Argument - March 19, 2001",60.2,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2000/105%20ORIG/20010319a_105orig.delivery.mp3
+supreme_court_transcripts/oyez/cases/2013.12-1163-t01.json,"Oral Argument - February 26, 2014",49.6,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2013/12-1163/20140226a_12-1163.delivery.mp3
+supreme_court_transcripts/oyez/cases/2009.08-1107-t01.json,"Oral Argument - November 10, 2009",47.9,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2009/08-1107/20091110a_08-1107.delivery.mp3
+supreme_court_transcripts/oyez/cases/2004.03-1293-t01.json,"Oral Argument - November 30, 2004",39.7,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2004/03-1293/20041130a_03-1293.delivery.mp3
+supreme_court_transcripts/oyez/cases/2009.08-1569-t01.json,"Oral Argument - February 23, 2010",51.2,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2009/08-1569/20100223a_08-1569.delivery.mp3
+supreme_court_transcripts/oyez/cases/2013.13-339-t01.json,"Oral Argument - April 23, 2014",60.9,8,https://s3.amazonaws.com/oyez.case-media.mp3/case_data/2013/13-339/20140423a_13-339.delivery.mp3
