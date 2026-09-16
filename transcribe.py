@@ -25,8 +25,10 @@ Examples
 # Many files straight at the replica pool (bypass the gateway):
   python transcribe.py *.m4a --urls http://localhost:8360,http://localhost:8361,http://localhost:8362
 
-# Transcribe AND summarize with Qwen3 (vLLM on port 8355):
+# Transcribe AND summarize (any OpenAI-compatible server; vLLM on 8355 here):
   python transcribe.py meeting.m4a --summarize
+  python transcribe.py meeting.m4a --summarize --vllm-url http://gpu-box:8000 \
+      --vllm-model Qwen/Qwen3-32B
 
 # Just summarize an existing transcript file:
   python transcribe.py --summarize-file transcript.txt
@@ -34,7 +36,10 @@ Examples
 Endpoints (override with env or flags):
   WHISPERX_URL   default http://localhost:8357   (nginx gateway; round-robins internally)
   WHISPERX_URLS  comma-separated replica pool for direct round-robin; overrides WHISPERX_URL
-  VLLM_URL       default http://localhost:8355   (your Qwen3 general model)
+  VLLM_URL       default http://localhost:8355   (any OpenAI-compatible server,
+                 local or remote; the summarizer is not tied to a given model)
+  VLLM_MODEL     model id to summarize with; default is whichever the server
+                 lists first at /v1/models
 """
 import argparse
 import json
@@ -205,7 +210,11 @@ def transcribe(audio_path, base_url, language="en", diarize=True,
             time.perf_counter() - transcription_started, 6)
 
 
-def summarize(transcript, vllm_url, max_tokens=2048, tag="", stats=None):
+def summarize(transcript, vllm_url, max_tokens=2048, tag="", stats=None,
+              model=None):
+    """Summarize via an OpenAI-compatible server. With no ``model``, ask the
+    server and take the first one it advertises — fine for a dedicated server,
+    ambiguous on a shared one, hence the override."""
     pfx = f"[{tag}] " if tag else ""
     durations = (stats if stats is not None else {}).setdefault(
         "client", {}).setdefault("durations_s", {})
@@ -213,9 +222,13 @@ def summarize(transcript, vllm_url, max_tokens=2048, tag="", stats=None):
     try:
         model_started = time.perf_counter()
         try:
-            response = requests.get(f"{vllm_url}/v1/models")
-            response.raise_for_status()
-            model = response.json()["data"][0]["id"]
+            if not model:
+                # Bounded: a remote endpoint that accepts the connection and
+                # then stalls would otherwise hang here forever, while the
+                # completion below is already capped.
+                response = requests.get(f"{vllm_url}/v1/models", timeout=30)
+                response.raise_for_status()
+                model = response.json()["data"][0]["id"]
         finally:
             durations["summary_model_lookup_s"] = round(
                 time.perf_counter() - model_started, 6)
@@ -259,7 +272,8 @@ def process_one(audio, base_url, args, tag="", print_summary=False):
             tag=tag, stats=stats)
         summary_out = None
         if args.summarize:
-            summary = summarize(text, args.vllm_url, tag=tag, stats=stats)
+            summary = summarize(text, args.vllm_url, tag=tag, stats=stats,
+                                model=args.vllm_model)
             summary_out = Path(audio).with_suffix(".summary.md")
             write_started = time.perf_counter()
             try:
@@ -346,7 +360,8 @@ def run_batch_direct(files, urls, args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="WhisperX transcribe + Qwen3 summarize")
+    ap = argparse.ArgumentParser(
+        description="WhisperX transcribe, with optional LLM summarization")
     ap.add_argument("audio", nargs="*", help="audio/video file(s) to transcribe")
     ap.add_argument("--language", default="en")
     ap.add_argument("--no-diarize", action="store_true",
@@ -370,6 +385,10 @@ def main():
                          "Ignored in --urls direct mode.")
     ap.add_argument("--vllm-url", default=VLLM_URL,
                     help=f"vLLM server URL for --summarize (default {VLLM_URL})")
+    ap.add_argument("--vllm-model", default=os.environ.get("VLLM_MODEL"),
+                    help="model id to summarize with (env VLLM_MODEL). Default: "
+                         "whichever the server lists first, which is ambiguous "
+                         "when it serves several.")
     args = ap.parse_args()
 
     urls = resolve_urls(args)
@@ -380,7 +399,8 @@ def main():
         overall_started = time.perf_counter()
         try:
             text = Path(args.summarize_file).read_text()
-            summary = summarize(text, args.vllm_url, stats=stats)
+            summary = summarize(text, args.vllm_url, stats=stats,
+                                model=args.vllm_model)
             out = Path(args.summarize_file).with_suffix(".summary.md")
             write_started = time.perf_counter()
             try:
