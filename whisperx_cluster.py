@@ -55,7 +55,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 BUILD_CONTEXT = "./whisperx"
 IMAGE = "whisperx-api:local"
-GEN_FILE = HERE / "docker-compose-whisperx.cluster.yml"
+GEN_FILE = HERE / "docker-compose.yml"
 NGINX_FILE = HERE / "whisperx-nginx.conf"
 NETWORK = "whisperx-net"
 PROJECT = "whisperx-cluster"  # compose project name, isolates these containers

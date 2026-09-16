@@ -53,7 +53,7 @@ def check_health(url):
         return True
     except Exception as e:
         print(f"{FAIL} Cannot reach {url}/health: {e}")
-        print("  Is the container up?  docker compose -f docker-compose-whisperx.yml ps")
+        print("  Is the container up?  python3 whisperx_cluster.py ps")
         return False
 
 
