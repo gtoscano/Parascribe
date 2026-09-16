@@ -87,8 +87,13 @@ status requests back to the owning replica by encoding the replica identity in
 the job identifier. Across five trials, the gateway shows no throughput penalty:
 its mean is $1$--$2\%$ above direct routing, within the observed execution
 variability. Finally we give a remainder-aware wave model for the wall-clock
-time of a batch of $N$ files on $R$ replicas. Three end-to-end trials show that
-the synchronized-wave estimate is conservative for continuously queued work,
+time of a batch of $N$ files on $R$ replicas. The model predicts that
+throughput is \emph{non-monotonic} in $N$, peaking whenever $R$ divides $N$
+and sagging on a partial wave; a sweep at fixed $R$ confirms this, with
+throughput at $N{=}4$ recovering to a value statistically indistinguishable
+from $N{=}2$ and predicted wall times within $1.4\%$ of measurement without a
+fitted parameter. Three end-to-end trials at $N{=}10$ show that the
+synchronized-wave estimate is conservative for continuously queued work,
 overpredicting the mean wall time by $4$--$7\%$. Our
 results give practitioners a concrete recipe for sizing single-GPU speech
 services and a cautionary tale about thread-level parallelism in GIL-bound
@@ -131,8 +136,9 @@ We make the following contributions:
   \emph{process-local job registry} problem by encoding replica identity in the
   job identifier and routing status requests accordingly.
   \item An evaluated, remainder-aware wave model (\S\ref{sec:model}) that
-  conservatively estimates homogeneous batch completion time from
-  concurrency-specific service times.
+  estimates homogeneous batch completion time from concurrency-specific
+  service times, and predicts the non-monotonic throughput that follows when
+  the in-flight job count is not a multiple of the replica count.
 \end{itemize}
 
 All experiments use a single GPU and off-the-shelf components; our aim is a
