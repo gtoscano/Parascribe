@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-09-16T21:44:16.510998+00:00",
+  "host": {
+    "hostname": "gpus",
+    "kernel": "6.8.0-137-generic",
+    "python": "3.12.3",
+    "cpu_cores": 12,
+    "cpu_model": "AMD EPYC 9454 48-Core Processor",
+    "total_ram_GiB": 165.05
+  },
+  "gpu": {
+    "index": 1,
+    "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "total_MiB": 97887.0,
+    "driver": "580.173.02"
+  },
+  "code": {
+    "git_commit": "62d8dd0db088beff8c2b57d662f37ca289120f31",
+    "git_dirty": false
+  },
+  "service": {
+    "urls": [
+      "http://localhost:8357"
+    ],
+    "image_id": "sha256:b845f421a32aec7d9ca2cc9a654bc777c5a310118b0f8bdaec8b8a1776cbd11b",
+    "image_created": "2026-09-16T20:52:14.795448962Z",
+    "health": [
+      {
+        "status": "ok",
+        "model": "large-v3",
+        "device": "cuda",
+        "diarization": true,
+        "workers": 1,
+        "replica_id": "1"
+      }
+    ],
+    "models": [
+      {
+        "whisper_model": "large-v3",
+        "device": "cuda",
+        "compute_type": "float16",
+        "default_language": "en",
+        "diarization_enabled": true,
+        "workers": 1,
+        "replica_id": "0"
+      }
+    ]
+  },
+  "workload": {
+    "audio": "testing_audio/dataset/ami/ES2005a.wav",
+    "audio_duration_s": 477.9,
+    "audio_bytes": 15292154,
+    "language": "en",
+    "diarize": true,
+    "num_speakers": null,
+    "levels": "1,2,3",
+    "repeat": 5,
+    "warmup": true,
+    "cooldown_s": 5.0
+  },
+  "idle_baseline": {
+    "gpu_mem_MiB": 18625,
+    "cpu_cores_busy": 0.347,
+    "host_ram_GiB": 19.156
+  }
+}
