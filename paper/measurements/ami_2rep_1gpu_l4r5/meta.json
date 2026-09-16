@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "captured_at": "2026-09-16T21:44:16.510998+00:00",
+  "captured_at": "2026-09-16T21:57:16.761049+00:00",
   "host": {
     "hostname": "gpus",
     "kernel": "6.8.0-137-generic",
@@ -16,8 +16,8 @@
     "driver": "580.173.02"
   },
   "code": {
-    "git_commit": "62d8dd0db088beff8c2b57d662f37ca289120f31",
-    "git_dirty": false
+    "git_commit": "09eae25b90239cfc2682febb33aeea243baa7bb1",
+    "git_dirty": true
   },
   "service": {
     "urls": [
@@ -54,14 +54,14 @@
     "language": "en",
     "diarize": true,
     "num_speakers": null,
-    "levels": "1,2,3",
+    "levels": "1,2,3,4",
     "repeat": 5,
     "warmup": true,
     "cooldown_s": 5.0
   },
   "idle_baseline": {
     "gpu_mem_MiB": 18625,
-    "cpu_cores_busy": 0.347,
-    "host_ram_GiB": 19.156
+    "cpu_cores_busy": 0.368,
+    "host_ram_GiB": 19.125
   }
 }

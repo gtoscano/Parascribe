@@ -333,19 +333,40 @@ W-long  & Oyez argument & $2400$\,s ($40$\,min) & 8 \\
 
 \paragraph{Methodology.} A load generator submits $c$ identical jobs
 concurrently and records: wall-clock time for the batch; per-job service time
-(server-side running$\rightarrow$finished); GPU memory and utilisation sampled
-at 2\,Hz via \texttt{nvidia-smi}; and host RAM. We report throughput in
+(server-side running$\rightarrow$finished); GPU memory, utilisation and power
+draw sampled at 2\,Hz via \texttt{nvidia-smi}; host RAM; and host CPU occupancy
+derived from \path{/proc/stat} deltas. CPU is reported in \emph{cores busy}
+rather than a percentage, since a percentage is not actionable for provisioning
+without the core count. Per-replica CPU and resident set size are attributed
+separately via \texttt{docker stats}, because the measurement host also runs
+unrelated services and a host-wide figure cannot be divided by the replica
+count. All resource figures are reported as deltas over an idle baseline
+measured immediately before each sweep.
+
+The service itself is instrumented: each stage of the pipeline
+(audio load, model preparation, transcription, alignment, diarisation, speaker
+assignment, serialisation, output write) is timed individually and persisted
+per job, alongside the queue wait. This separates \emph{preparing} a model from
+\emph{using} it, a distinction that a single end-to-end duration cannot express
+and that Section~\ref{sec:results} relies on to attribute contention to a
+specific stage. We report throughput in
 files\,min\textsuperscript{-1} and the real-time factor
 $\mathrm{RTF}=\text{(audio seconds)}/\text{(wall seconds per file)}$. Models are
 warmed once per service configuration. We then invoke the load generator
 independently five times for every thread, process-scaling, and gateway
 configuration; the two expensive ten-file batch validations are repeated three
-times. Each invocation records a fresh 2-second idle baseline, and multi-level
+times. Each invocation records a fresh idle baseline, and multi-level
 sweeps use a 5-second cooldown between levels. Unless stated otherwise, values
 are arithmetic mean and sample standard deviation, written
-\msd{mean}{SD}; speedups are ratios of repeated means. All retained trials had
-zero failed jobs. The raw per-trial CSV files accompany the paper in
-\texttt{measurements/repetitions/}.
+\msd{mean}{SD}; speedups are ratios of repeated means. Where an interval is
+given it is a two-sided 95\% confidence interval computed with Student's $t$;
+at five repetitions the $t$ multiplier is $2.776$, and using the normal
+approximation would understate the interval by roughly~40\%. All retained
+trials had zero failed jobs. The raw per-trial CSV files accompany the paper in
+\texttt{measurements/repetitions/}; the stage-level and resource measurements
+of Section~\ref{sec:results} are in \texttt{measurements/ami\_2rep\_1gpu\_l4r5/},
+each run carrying a provenance record naming the code revision, GPU driver and
+container image that produced it.
 
 % ===========================================================================
 \section{Results}
@@ -577,6 +598,175 @@ $10\times$ W-long (40\,min)  & \msd{395.0}{2.0}\,s
 \end{table}
 
 % ===========================================================================
+% ===========================================================================
+% DRAFT — proposed addition to \section{Results}.
+% Insert after \subsection{No gateway penalty is observed}.
+% Data: measurements/ami_2rep_1gpu_l4r5/, n=5 per level.
+% ===========================================================================
+
+\subsection{Over-subscription is governed by wave quantisation}
+\label{sec:oversub}
+
+The preceding sections vary the number of replicas with offered concurrency
+held equal to it. A deployment does not get that luxury: the
+replica count is fixed at provisioning time and the arrival rate is not. We
+therefore fix a two-replica deployment and vary only the offered concurrency
+$c$ (Table~\ref{tab:oversub}).
+
+Throughput is not monotonic in $c$. It rises from $c=1$ to $c=2$, \emph{falls}
+at $c=3$, and returns at $c=4$ to a value statistically indistinguishable from
+$c=2$ (the 95\% intervals $[8.372, 8.392]$ and $[8.304, 8.416]$ overlap). A
+dip that reverses is not contention, which would worsen monotonically.
+
+The explanation is quantisation. With $R$ replicas each running one job at a
+time, $c$ offered jobs execute in $\lceil c/R \rceil$ waves, and a wave costs
+what its \emph{widest} occupancy costs. Writing $T_k$ for the wall time of a
+wave of $k$ concurrent jobs, the batch completes in
+\begin{equation}
+T(c) \;=\; \Big\lfloor \tfrac{c}{R} \Big\rfloor \, T_R \;+\;
+           \big[\, c \bmod R > 0 \,\big] \; T_{c \bmod R},
+\label{eq:waves}
+\end{equation}
+so throughput $c/T(c)$ peaks whenever $R \mid c$ and sags otherwise, because a
+partial final wave occupies the same elapsed time as a full one while
+completing fewer jobs. With the measured $T_1 = 10.18$\,s and $T_2 =
+14.31$\,s, Equation~\ref{eq:waves} predicts $T(3) = 24.49$\,s and $T(4) =
+28.63$\,s against observed $24.15$\,s and $28.71$\,s --- errors of $-1.4\%$ and
+$+0.3\%$ with no fitted parameter.
+
+The practical consequence is that a two-replica deployment serving an odd
+in-flight count wastes roughly half a wave. Provisioning should therefore match
+the replica count to the expected concurrency, or admit jobs in multiples of
+$R$; adding replicas that leave $R \nmid c$ can measurably reduce throughput.
+
+Two caveats. First, $c=3$ is also the only unstable level: its coefficient of
+variation is $4.2\%$ against $\le 0.5\%$ elsewhere, and its five observations
+fall into two clusters ($22.4$\,s once, $24.5$--$24.7$\,s four times) rather
+than scattering about the mean. Equation~\ref{eq:waves} assumes the partial
+wave starts only once a full wave has drained, whereas the trailing job can in
+fact start as soon as the \emph{first} replica frees; the faster cluster is
+consistent with greater overlap between waves. We report the effect without
+claiming to have characterised it. Second, the mean of a bimodal level
+describes a state the system does not occupy, so Table~\ref{tab:oversub}
+reports dispersion alongside it.
+
+\begin{table}[t]
+\centering
+\caption{Offered concurrency against a \emph{fixed} two-replica deployment
+(W-short). Throughput is mean (sample SD) with a two-sided 95\% $t$ interval,
+$n=5$. Efficiency is speedup over $c=1$ divided by $c$; $e$ is the Karp--Flatt
+experimentally determined serial fraction. Throughput at $c=4$ recovers to the
+$c=2$ value because both are integer multiples of the replica count.}
+\label{tab:oversub}
+\begin{tabular}{ccccc}
+\toprule
+Offered & Throughput & 95\% CI & Efficiency & Karp--Flatt \\
+$c$ & (\filesmin) & (\filesmin) & (\%) & $e$ \\
+\midrule
+1 & \msd{5.896}{0.005} & $[5.889,\,5.903]$ & $99.9$ & --- \\
+2 & \msd{8.382}{0.008} & $[8.372,\,8.392]$ & $71.1$ & $0.406$ \\
+3 & \msd{7.462}{0.313} & $[7.073,\,7.851]$ & $45.3$ & $0.603$ \\
+4 & \msd{8.360}{0.045} & $[8.304,\,8.416]$ & $35.6$ & $0.604$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Karp--Flatt fraction rises from $0.406$ at $c=2$ to $\approx 0.60$ at
+$c=3$ and $c=4$, then holds. Read with Equation~\ref{eq:waves}, the step is
+queueing entering the measurement rather than a larger serial section: the
+metric attributes the whole of a partial wave's idle time to serialisation,
+which is arithmetically correct but conflates two mechanisms. We report it
+because a rising $e$ distinguishes overhead from an inherently serial section,
+which speedup alone cannot; we do not read the absolute value as a property of
+the pipeline.
+
+\subsection{Contention is concentrated in ASR and diarisation}
+\label{sec:stages}
+
+Per-stage instrumentation (\S\ref{sec:setup}) localises where concurrency is
+paid for. Table~\ref{tab:stages} gives the mean duration of each stage at each
+offered concurrency.
+
+\begin{table}[t]
+\centering
+\caption{Server stage means in seconds (share of \texttt{pipeline}), fixed
+two-replica deployment, $n=5$ per level. Alignment is invariant to concurrency;
+transcription and diarisation roughly double from $c=1$ to $c=2$. Model
+preparation is $0.00$ throughout: the caches are mounted and the run is warmed,
+so it is excluded by construction.}
+\label{tab:stages}
+\begin{tabular}{lcccc}
+\toprule
+Stage & $c=1$ & $c=2$ & $c=3$ & $c=4$ \\
+\midrule
+Queue wait        & $0.00$ & $0.00$ & $4.44$ & $6.61$ \\
+Audio load        & $0.14$ & $0.15$ & $0.15$ & $0.13$ \\
+Transcription     & $1.88$ & $3.47$ & $2.91$ & $3.46$ \\
+Alignment         & $3.02$ & $2.99$ & $3.04$ & $2.99$ \\
+Diarisation       & $3.20$ & $6.26$ & $5.26$ & $6.25$ \\
+Speaker assign.   & $0.47$ & $0.47$ & $0.47$ & $0.47$ \\
+\midrule
+Pipeline total    & $8.72$ & $13.34$ & $11.84$ & $13.30$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Going from one in-flight job to two, transcription grows $1.88 \to 3.47$\,s and
+diarisation $3.20 \to 6.26$\,s --- both close to a factor of two, meaning the
+two replicas obtain almost no overlap in these stages. Alignment is flat
+($3.02 \to 2.99$\,s): it overlaps essentially perfectly. Speaker assignment and
+audio load are invariant and negligible.
+
+This is the mechanism behind the $71.1\%$ efficiency at $c=2$. Two of the three
+substantial stages serialise on GPU compute while the third does not, so the
+achievable speedup is bounded well below linear no matter how many replicas are
+added to one GPU. It also identifies diarisation --- $47\%$ of pipeline time at
+$c=2$, the single largest component --- as the highest-value target for
+optimisation, ahead of the ASR pass that dominates the popular understanding of
+transcription cost.
+
+\subsection{Provisioning: the host CPU binds before the GPU}
+\label{sec:capacity}
+
+Table~\ref{tab:capacity} reports the marginal resource cost of one concurrent
+job, measured as a delta over an idle baseline taken immediately before the
+sweep.
+
+\begin{table}[t]
+\centering
+\caption{Marginal cost of one concurrent job and the resulting ceiling on this
+host (12 vCPU, $165.1$\,GiB RAM, one $97\,887$\,MiB GPU). GPU memory is
+\emph{incremental}: the idle baseline already holds $18\,625$\,MiB of resident
+model weights.}
+\label{tab:capacity}
+\begin{tabular}{lcc}
+\toprule
+Resource & Per concurrent job & Host ceiling (jobs) \\
+\midrule
+CPU           & $2.39$ cores   & $\approx 5$ \\
+GPU memory    & $3760$\,MiB    & $\approx 26$ \\
+Host RAM      & $0.09$\,GiB    & $\approx 1833$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The binding resource is the host CPU, not the GPU. Twelve vCPUs are exhausted
+at roughly five concurrent jobs, while the $96$\,GiB GPU would accommodate
+about twenty-six. For a pipeline whose cost is usually discussed in terms of
+GPU capability, the accelerator is the abundant resource here and the host is
+scarce: a deployment that provisions by GPU memory will be CPU-starved long
+before the card is full.
+
+Throughput saturates earlier still, at $c=2$ (\S\ref{sec:oversub}), so neither
+ceiling is reached in practice on this pipeline --- the operative limit is GPU
+compute contention. The ceilings nonetheless bound what additional GPUs can
+buy: at $2.39$ cores per job, twelve vCPUs cannot feed many more concurrent
+jobs regardless of how many accelerators are added, so scaling this deployment
+across GPUs requires scaling host cores with them.
+
+Energy is modest: $213$\,W mean draw at the $c=2$ operating point, or
+$\approx 3$\,Wh per hour of audio transcribed.
+
 \section{Discussion}
 \label{sec:discussion}
 
@@ -726,6 +916,11 @@ replica); adjust paths and ports for your setup.
 
 \subsection{Cluster setup}
 \begin{lstlisting}[language=]
+# Pre-download the weights. Only the libraries are baked into the image, so
+# without this the first request of a fresh deployment pays the download.
+python3 fetch_models.py
+python3 fetch_models.py --check   # exits non-zero if anything is missing
+
 # Build the image and start k replicas on one GPU behind the nginx gateway
 REPLICAS=3 python3 whisperx_cluster.py up
 
@@ -745,8 +940,8 @@ generator varies offered concurrency from one to four jobs: at level~1 only one
 worker is active, at level~2 both worker threads are active, and at level~4 the
 two workers process the jobs in two waves.
 \begin{lstlisting}[language=]
-# Set `- WORKERS=2` in docker-compose-whisperx.yml, then:
-docker compose -f docker-compose-whisperx.yml up -d --build
+# Set `- WORKERS=2` in docker-compose.yml, then:
+docker compose -p whisperx-cluster up -d --build
 
 python3 benchmark_transcribe.py \
     --url http://localhost:8357 \
