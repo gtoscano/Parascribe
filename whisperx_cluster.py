@@ -170,6 +170,11 @@ def _replica_block(idx: int, host_port: int, gpu: str) -> str:
       - HUGGINGFACE_HUB_TOKEN=${{HUGGINGFACE_HUB_TOKEN}}
       - HF_TOKEN=${{HUGGINGFACE_HUB_TOKEN}}
       - HF_HOME=/workspace/.cache/huggingface
+      # Alignment weights come from torchaudio, not the Hub, so they land in
+      # the torch cache. Without this the 361 MB wav2vec2 checkpoint is
+      # re-downloaded inside every new container — ~34s on a replica's first
+      # job, against ~0.7s for the alignment itself.
+      - TORCH_HOME=/root/.cache/torch
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - CUDA_VISIBLE_DEVICES=0
       - WHISPER_MODEL=large-v3
@@ -184,6 +189,7 @@ def _replica_block(idx: int, host_port: int, gpu: str) -> str:
       - REPLICA_ID={idx}
     volumes:
       - ~/.cache/huggingface:/workspace/.cache/huggingface
+      - ~/.cache/torch:/root/.cache/torch
       - ./whisperx/data:/data
     networks:
       - {NETWORK}
