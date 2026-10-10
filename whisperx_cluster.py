@@ -182,6 +182,17 @@ def _replica_block(idx: int, host_port: int, gpu: str) -> str:
       - DEFAULT_LANGUAGE=en
       - BATCH_SIZE=16
       - DATA_DIR=/data
+      # V2 sentence/realtime transcription uses multilingual Parakeet v3
+      # INT8 on CPU; WhisperX remains the unchanged V1 batch pipeline.
+      - SESSION_ASR_MODEL=nemo-parakeet-tdt-0.6b-v3
+      - SESSION_ASR_QUANTIZATION=int8
+      - SESSION_ASR_THREADS=8
+      # V2 speaker embeddings are compared only inside one session. These
+      # thresholds must be calibrated against representative recordings.
+      - VOICEPRINT_MODEL=pyannote/wespeaker-voxceleb-resnet34-LM
+      - VOICEPRINT_SIMILARITY_THRESHOLD=0.50
+      - VOICEPRINT_UPDATE_THRESHOLD=0.70
+      - STREAM_MAX_UTTERANCE_SECONDS=60
       # One worker per replica: parallelism comes from multiple replica
       # processes, not threads. REPLICA_ID is stamped onto job_ids so the
       # gateway can route job lookups back here.
@@ -295,6 +306,13 @@ http {{
     proxy_send_timeout 7200s;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    map $http_upgrade $connection_upgrade {{
+        default upgrade;
+        '' close;
+    }}
 
     server {{
         listen 8000;

@@ -24,6 +24,7 @@ RUN printf 'torch==2.7.1\ntorchaudio==2.7.1\nnumpy<2.2\n' > /tmp/constraints.txt
     && pip install -c /tmp/constraints.txt -r requirements.txt \
     && pip install -c /tmp/constraints.txt \
         "fastapi==0.115.*" "uvicorn[standard]==0.34.*" python-multipart \
+        "httpx==0.28.*" \
     # whisperx pins ctranslate2<4.5.0, but 4.4.0 links cuDNN 8 while this image
     # (and Blackwell) needs the cuDNN 9 build. 4.8.0 works with faster-whisper.
     && pip install --no-deps "ctranslate2==4.8.0" \
@@ -33,7 +34,7 @@ RUN printf 'torch==2.7.1\ntorchaudio==2.7.1\nnumpy<2.2\n' > /tmp/constraints.txt
     && pip install -c /tmp/constraints.txt \
         "huggingface_hub==0.34.4" "transformers==4.48.3"
 
-COPY server.py /app/server.py
+COPY server.py sentence_asr.py session_store.py voiceprints.py /app/
 
 EXPOSE 8000
 

@@ -15,6 +15,7 @@ exactly the ones the service will load. No host Python deps beyond stdlib.
 
 What it fetches:
   faster-whisper <model>    ASR weights            (Systran/faster-whisper-*)
+  Parakeet TDT v3 INT8      v2 sentence/realtime   (onnx-asr/Hugging Face)
   pyannote segmentation     diarization stage 1    (gated: needs HF_TOKEN)
   pyannote diarization 3.1  diarization pipeline   (gated: needs HF_TOKEN)
   wespeaker voxceleb        speaker embeddings     (pulled by the pipeline)
@@ -49,10 +50,17 @@ BUILD_CONTEXT = "./whisperx"
 HF_CACHE = Path.home() / ".cache" / "huggingface"
 TORCH_CACHE = Path.home() / ".cache" / "torch"
 
+SESSION_ASR_REPOS = [
+    "istupakov/parakeet-tdt-0.6b-v3-onnx",
+]
+
+VOICEPRINT_REPOS = [
+    "pyannote/wespeaker-voxceleb-resnet34-LM",
+]
+
 PYANNOTE_REPOS = [
     "pyannote/segmentation-3.0",
     "pyannote/speaker-diarization-3.1",
-    "pyannote/wespeaker-voxceleb-resnet34-LM",
 ]
 
 # Runs inside the container. Prints one "STATUS<TAB>name<TAB>detail" line per
@@ -195,9 +203,11 @@ def main() -> int:
                           cwd=HERE).returncode:
             return 2
 
-    repos = [] if args.no_diarize else PYANNOTE_REPOS
+    repos = SESSION_ASR_REPOS + VOICEPRINT_REPOS
+    if not args.no_diarize:
+        repos += PYANNOTE_REPOS
     token = _token()
-    if repos and not token:
+    if not args.no_diarize and not token:
         print("warning: no HUGGINGFACE_HUB_TOKEN/HF_TOKEN found; the pyannote "
               "repos are gated and will fail. Set it in .env, or pass "
               "--no-diarize.", file=sys.stderr)

@@ -10,6 +10,11 @@ transcription, wav2vec2 for word-level alignment, and
 **scales it across GPUs** with a process-replica architecture behind a single
 nginx gateway.
 
+The experimental v2 API adds sentence/realtime ingestion and session-local
+speaker voiceprints without changing the working v1 batch API. See
+[`README-v2.md`](README-v2.md) for its protocol, privacy model, and current
+limitations.
+
 It ships with the serving stack, a multi-GPU launcher, a client, a benchmark
 suite, and a short paper (`paper/`) that measures the whole thing.
 

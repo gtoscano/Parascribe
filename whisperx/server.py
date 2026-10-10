@@ -18,21 +18,39 @@ Endpoints:
   GET  /v1/jobs/{job_id}/transcript.srt
   GET  /v1/jobs/{job_id}/result.json
   GET  /v1/jobs/{job_id}/timings.json
+  POST /v2/sessions                   -> create a conversation/session
+  GET  /v2/sessions/{session_id}      -> session transcript
+  POST /v2/sessions/{session_id}/sentences
+  WS   /v2/sessions/{session_id}/stream
+  DELETE /v2/sessions/{session_id}/voiceprints
+  POST /v2/sessions/{session_id}/end
 """
 import asyncio
 import json
 import os
 import shutil
+import subprocess
 import time
 import traceback
 import uuid
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import (
+    FastAPI, File, Form, HTTPException, UploadFile, WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
+
+from sentence_asr import DEFAULT_MODEL as DEFAULT_SENTENCE_ASR_MODEL
+from sentence_asr import ParakeetSentenceTranscriber
+from session_store import SessionEnded, SessionNotFound, SessionStore
+from voiceprints import DEFAULT_MODEL as DEFAULT_VOICEPRINT_MODEL
+from voiceprints import VoiceprintExtractor
 
 # ----------------------------------------------------------------------------
 # Config (override via environment in the compose file)
@@ -49,12 +67,30 @@ COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "float16")  # try "int8" if VRAM t
 DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "en")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+SESSION_ASR_MODEL = os.environ.get(
+    "SESSION_ASR_MODEL", DEFAULT_SENTENCE_ASR_MODEL)
+SESSION_ASR_MODEL_DIR = os.environ.get("SESSION_ASR_MODEL_DIR") or None
+SESSION_ASR_QUANTIZATION = os.environ.get("SESSION_ASR_QUANTIZATION", "int8")
+SESSION_ASR_THREADS = int(os.environ.get(
+    "SESSION_ASR_THREADS", str(max(1, (os.cpu_count() or 4) // 2))))
+SESSION_ASR_MIN_CONFIDENCE = float(
+    os.environ.get("SESSION_ASR_MIN_CONFIDENCE", "0"))
+VOICEPRINT_MODEL = os.environ.get("VOICEPRINT_MODEL", DEFAULT_VOICEPRINT_MODEL)
+VOICEPRINT_SIMILARITY_THRESHOLD = float(
+    os.environ.get("VOICEPRINT_SIMILARITY_THRESHOLD", "0.50"))
+VOICEPRINT_UPDATE_THRESHOLD = float(
+    os.environ.get("VOICEPRINT_UPDATE_THRESHOLD", "0.70"))
+STREAM_MAX_UTTERANCE_SECONDS = float(
+    os.environ.get("STREAM_MAX_UTTERANCE_SECONDS", "60"))
+SENTENCE_MAX_UPLOAD_BYTES = int(
+    os.environ.get("SENTENCE_MAX_UPLOAD_BYTES", str(32 * 1024 * 1024)))
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 IN_DIR = DATA_DIR / "in"
 OUT_DIR = DATA_DIR / "out"
 for d in (IN_DIR, OUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
+SESSION_STORE = SessionStore(DATA_DIR / "sessions.sqlite3")
 
 # ----------------------------------------------------------------------------
 # PyTorch >= 2.6 defaults torch.load(weights_only=True), which breaks loading
@@ -105,6 +141,8 @@ class ModelSet:
         self._asr = None
         self._align: Dict[str, Any] = {}
         self._diarize = None
+        self._sentence_asr = None
+        self._voiceprint = None
 
     def get_asr(self):
         if self._asr is None:
@@ -125,6 +163,23 @@ class ModelSet:
         if self._diarize is None:
             self._diarize = _load_diarize_pipeline()
         return self._diarize
+
+    def get_voiceprint(self):
+        if self._voiceprint is None:
+            self._voiceprint = VoiceprintExtractor(
+                model_name=VOICEPRINT_MODEL, device=DEVICE, token=HF_TOKEN)
+        return self._voiceprint
+
+    def get_sentence_asr(self):
+        if self._sentence_asr is None:
+            self._sentence_asr = ParakeetSentenceTranscriber(
+                model_name=SESSION_ASR_MODEL,
+                model_dir=SESSION_ASR_MODEL_DIR,
+                quantization=SESSION_ASR_QUANTIZATION,
+                threads=SESSION_ASR_THREADS,
+                min_confidence=SESSION_ASR_MIN_CONFIDENCE,
+            )
+        return self._sentence_asr
 
 
 # ----------------------------------------------------------------------------
@@ -284,6 +339,80 @@ def run_transcription(job: Dict[str, Any], models: "ModelSet"):
         time.perf_counter() - pipeline_started, 6)
 
 
+def _load_audio_16k(path: str) -> "Any":
+    """Decode any ffmpeg-readable upload to mono 16 kHz float32 samples."""
+    import numpy as np
+
+    command = [
+        "ffmpeg", "-nostdin", "-threads", "0", "-i", path,
+        "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le",
+        "-ar", "16000", "-",
+    ]
+    raw = subprocess.run(command, capture_output=True, check=True).stdout
+    return np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
+
+
+def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
+    """Transcribe with Parakeet and identify one speaker within a session."""
+    pipeline_started = time.perf_counter()
+    audio_path = job["audio_path"]
+    language = job.get("language") or None
+
+    job["stage"] = "decode_audio"
+    audio = _timed(job, "decode_audio_s", _load_audio_16k, audio_path)
+    audio_seconds = len(audio) / 16000.0
+
+    job["stage"] = "transcribe"
+    asr = _timed(job, "prepare_sentence_asr_model_s", models.get_sentence_asr)
+    text, lang = _timed(
+        job, "transcribe_s", asr.transcribe, audio, language=language)
+    if not text:
+        raise ValueError("no speech was transcribed from this utterance")
+
+    session = SESSION_STORE.get_session(job["session_id"])
+    speaker_id = None
+    similarity = None
+    enrolled = False
+    if session["capture_voiceprints"]:
+        job["stage"] = "voiceprint"
+        extractor = _timed(
+            job, "prepare_voiceprint_model_s", models.get_voiceprint)
+        embedding = _timed(
+            job, "extract_voiceprint_s", extractor, audio_path,
+            audio_seconds=audio_seconds)
+        speaker_id, similarity, enrolled = _timed(
+            job, "match_voiceprint_s", SESSION_STORE.match_voiceprint,
+            job["session_id"], embedding, audio_seconds=audio_seconds,
+            similarity_threshold=VOICEPRINT_SIMILARITY_THRESHOLD,
+            update_threshold=VOICEPRINT_UPDATE_THRESHOLD,
+        )
+    else:
+        job["timings"].update({
+            "prepare_voiceprint_model_s": 0.0,
+            "extract_voiceprint_s": 0.0,
+            "match_voiceprint_s": 0.0,
+        })
+
+    job["stage"] = "store_utterance"
+    utterance = _timed(
+        job, "store_utterance_s", SESSION_STORE.append_utterance,
+        job["session_id"], text=text, language=lang, speaker_id=speaker_id,
+        speaker_similarity=similarity, audio_seconds=audio_seconds,
+        source=job.get("source", "sentence"),
+    )
+    job["result"] = {
+        **utterance,
+        "speaker": {
+            "id": speaker_id,
+            "similarity": similarity,
+            "enrolled": enrolled,
+            "signature_stored": speaker_id is not None,
+        },
+    }
+    job["timings"]["pipeline_s"] = round(
+        time.perf_counter() - pipeline_started, 6)
+
+
 # ----------------------------------------------------------------------------
 # Job queue: WORKERS parallel workers, simple in-memory registry + on-disk
 # results. Each worker owns a private ModelSet and runs its blocking job in a
@@ -295,7 +424,7 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 _queue: "asyncio.Queue[str]" = None  # set on startup
 _executor: "ThreadPoolExecutor" = None  # set on startup
 
-app = FastAPI(title="WhisperX API", version="1.0")
+app = FastAPI(title="Parascribe API", version="2.0")
 
 
 def _now() -> str:
@@ -354,7 +483,8 @@ async def _worker(worker_id: int, models: "ModelSet"):
         job["worker"] = worker_id
         job["started_at"] = _now()
         try:
-            await loop.run_in_executor(_executor, run_transcription, job, models)
+            runner = job.get("_runner", run_transcription)
+            await loop.run_in_executor(_executor, runner, job, models)
             job["status"] = "done"
             job["stage"] = "done"
         except Exception as e:
@@ -386,6 +516,20 @@ async def _worker(worker_id: int, models: "ModelSet"):
                                 + "\nFailed to persist job metadata:\n"
                                 + persistence_error).strip()
                 job["status"] = "error"
+            if job.get("_delete_audio"):
+                try:
+                    Path(job["audio_path"]).unlink(missing_ok=True)
+                except Exception:
+                    job["error"] = (job.get("error", "")
+                                    + "\nFailed to delete temporary audio:\n"
+                                    + traceback.format_exc()).strip()
+                    job["status"] = "error"
+            future = job.get("_future")
+            if future is not None and not future.done():
+                if job["status"] == "done":
+                    future.set_result(job["result"])
+                else:
+                    future.set_exception(RuntimeError(job.get("error", "job failed")))
             _queue.task_done()
 
 
@@ -405,7 +549,8 @@ async def _startup():
 async def health():
     return {"status": "ok", "model": WHISPER_MODEL, "device": DEVICE,
             "diarization": bool(HF_TOKEN), "workers": WORKERS,
-            "replica_id": REPLICA_ID}
+            "session_asr": SESSION_ASR_MODEL,
+            "voiceprints": True, "replica_id": REPLICA_ID}
 
 
 @app.get("/v1/models")
@@ -413,16 +558,22 @@ async def models():
     return {"whisper_model": WHISPER_MODEL, "device": DEVICE,
             "compute_type": COMPUTE_TYPE, "default_language": DEFAULT_LANGUAGE,
             "diarization_enabled": bool(HF_TOKEN), "workers": WORKERS,
+            "session_asr_model": SESSION_ASR_MODEL,
+            "session_asr_quantization": SESSION_ASR_QUANTIZATION,
+            "session_asr_device": "cpu",
+            "voiceprint_model": VOICEPRINT_MODEL,
+            "voiceprint_similarity_threshold": VOICEPRINT_SIMILARITY_THRESHOLD,
             "replica_id": REPLICA_ID}
 
 
 def _public(job: Dict[str, Any]) -> Dict[str, Any]:
     fields = ["job_id", "status", "stage", "filename", "created_at",
               "received_at", "uploaded_at", "queued_at", "started_at",
-              "finished_at", "error", "num_speakers", "worker"]
+              "finished_at", "error", "num_speakers", "worker", "session_id",
+              "source"]
     out = {k: job.get(k) for k in fields if k in job}
     out["timings"] = dict(job.get("timings", {}))
-    if job.get("result"):
+    if job.get("result") and job.get("kind", "batch") == "batch":
         out["num_speakers"] = job["result"].get("num_speakers")
         out["language"] = job["result"].get("language")
         out["links"] = {
@@ -430,6 +581,8 @@ def _public(job: Dict[str, Any]) -> Dict[str, Any]:
             "srt": f"/v1/jobs/{job['job_id']}/transcript.srt",
             "json": f"/v1/jobs/{job['job_id']}/result.json",
         }
+    elif job.get("result"):
+        out["links"] = {"json": f"/v1/jobs/{job['job_id']}/result.json"}
     if job.get("finished_at"):
         out.setdefault("links", {})["timings"] = (
             f"/v1/jobs/{job['job_id']}/timings.json")
@@ -487,6 +640,281 @@ async def transcribe(
     JOBS[job_id] = job
     await _queue.put(job_id)
     return JSONResponse(_public(job), status_code=202)
+
+
+# ----------------------------------------------------------------------------
+# V2: session-local sentence transcription and voice recognition
+# ----------------------------------------------------------------------------
+class CreateSessionRequest(BaseModel):
+    capture_voiceprints: bool = True
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EndSessionRequest(BaseModel):
+    delete_voiceprints: bool = False
+
+
+def _session_or_404(session_id: str, *, utterances: bool = False) -> dict:
+    try:
+        return SESSION_STORE.get_session(session_id, include_utterances=utterances)
+    except SessionNotFound as error:
+        raise HTTPException(404, "session not found") from error
+
+
+def _session_error(error: Exception) -> HTTPException:
+    if isinstance(error, SessionNotFound):
+        return HTTPException(404, "session not found")
+    if isinstance(error, SessionEnded):
+        return HTTPException(409, "session has ended")
+    return HTTPException(400, str(error))
+
+
+def _new_session_job(
+    session_id: str,
+    audio_path: Path,
+    *,
+    filename: str,
+    language: str | None,
+    source: str,
+    upload_save_s: float,
+    job_id: str | None = None,
+    future=None,
+) -> Dict[str, Any]:
+    received_perf = time.perf_counter()
+    now = _now()
+    job_id = job_id or f"{REPLICA_ID}-{uuid.uuid4().hex[:12]}"
+    job = {
+        "job_id": job_id,
+        "kind": "session_utterance",
+        "status": "queued",
+        "stage": "queued",
+        "filename": filename,
+        "audio_path": str(audio_path),
+        "language": language,
+        "session_id": session_id,
+        "source": source,
+        "received_at": now,
+        "uploaded_at": now,
+        "created_at": now,
+        "queued_at": now,
+        "timings": {"upload_save_s": upload_save_s},
+        "_received_perf": received_perf,
+        "_queued_perf": time.perf_counter(),
+        "_runner": run_session_utterance,
+        "_delete_audio": True,
+    }
+    if future is not None:
+        job["_future"] = future
+    JOBS[job_id] = job
+    return job
+
+
+@app.post("/v2/sessions")
+async def create_session(request: CreateSessionRequest):
+    return SESSION_STORE.create_session(
+        capture_voiceprints=request.capture_voiceprints,
+        metadata=request.metadata,
+    )
+
+
+@app.get("/v2/sessions/{session_id}")
+async def get_session(session_id: str):
+    return _session_or_404(session_id, utterances=True)
+
+
+@app.post("/v2/sessions/{session_id}/sentences")
+async def transcribe_sentence(
+    session_id: str,
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+):
+    session = _session_or_404(session_id)
+    if session["status"] != "active":
+        raise HTTPException(409, "session has ended")
+
+    suffix = Path(file.filename or "utterance").suffix or ".wav"
+    job_id = f"{REPLICA_ID}-{uuid.uuid4().hex[:12]}"
+    audio_path = IN_DIR / f"{job_id}{suffix}"
+    started = time.perf_counter()
+    written = 0
+    try:
+        with audio_path.open("wb") as target:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > SENTENCE_MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "sentence audio is too large")
+                target.write(chunk)
+    except Exception:
+        audio_path.unlink(missing_ok=True)
+        raise
+    job = _new_session_job(
+        session_id, audio_path, filename=file.filename or "utterance",
+        language=language, source="sentence",
+        upload_save_s=round(time.perf_counter() - started, 6),
+        job_id=job_id,
+    )
+    await _queue.put(job["job_id"])
+    return JSONResponse(_public(job), status_code=202)
+
+
+@app.delete("/v2/sessions/{session_id}/voiceprints")
+async def delete_session_voiceprints(session_id: str):
+    try:
+        deleted = SESSION_STORE.delete_voiceprints(session_id)
+    except (SessionNotFound, SessionEnded, ValueError) as error:
+        raise _session_error(error) from error
+    return {"session_id": session_id, "deleted_voiceprints": deleted,
+            "capture_voiceprints": False}
+
+
+@app.post("/v2/sessions/{session_id}/end")
+async def end_session(session_id: str, request: EndSessionRequest):
+    try:
+        return SESSION_STORE.end_session(
+            session_id, delete_voiceprints=request.delete_voiceprints)
+    except (SessionNotFound, ValueError) as error:
+        raise _session_error(error) from error
+
+
+def _write_pcm16_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
+    if len(pcm) % 2:
+        raise ValueError("PCM16 audio must contain complete 16-bit samples")
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(pcm)
+
+
+@app.websocket("/v2/sessions/{session_id}/stream")
+async def stream_session(ws: WebSocket, session_id: str):
+    try:
+        session = SESSION_STORE.get_session(session_id)
+    except SessionNotFound:
+        await ws.close(code=4404, reason="session not found")
+        return
+    if session["status"] != "active":
+        await ws.close(code=4409, reason="session has ended")
+        return
+
+    await ws.accept()
+    pending: asyncio.Queue = asyncio.Queue(maxsize=8)
+    send_lock = asyncio.Lock()
+    sample_rate = 16000
+    audio = bytearray()
+    started = False
+
+    async def send(message: dict):
+        async with send_lock:
+            await ws.send_json(message)
+
+    async def process_utterances():
+        while True:
+            item = await pending.get()
+            if item is None:
+                pending.task_done()
+                return
+            pcm, client_utterance_id = item
+            job_id = f"{REPLICA_ID}-{uuid.uuid4().hex[:12]}"
+            path = IN_DIR / f"{job_id}.wav"
+            try:
+                write_started = time.perf_counter()
+                await asyncio.to_thread(_write_pcm16_wav, path, pcm, sample_rate)
+                future = asyncio.get_running_loop().create_future()
+                job = _new_session_job(
+                    session_id, path, filename=f"{client_utterance_id}.wav",
+                    language=None, source="realtime",
+                    upload_save_s=round(time.perf_counter() - write_started, 6),
+                    job_id=job_id,
+                    future=future,
+                )
+                await _queue.put(job["job_id"])
+                await send({"type": "utterance_queued", "job_id": job["job_id"],
+                            "client_utterance_id": client_utterance_id})
+                result = await future
+                await send({"type": "utterance", "job_id": job["job_id"],
+                            "client_utterance_id": client_utterance_id,
+                            "result": result})
+            except Exception as error:  # keep the stream alive for the next sentence
+                path.unlink(missing_ok=True)
+                await send({"type": "utterance_error",
+                            "client_utterance_id": client_utterance_id,
+                            "error": str(error)})
+            finally:
+                pending.task_done()
+
+    processor = asyncio.create_task(process_utterances())
+    await send({"type": "ready", "session": session,
+                "audio": {"format": "pcm_s16le", "sample_rate": sample_rate,
+                          "channels": 1}})
+    try:
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            if message.get("bytes") is not None:
+                if not started:
+                    await send({"type": "error", "error": "send start before audio"})
+                    continue
+                audio.extend(message["bytes"])
+                max_bytes = int(STREAM_MAX_UTTERANCE_SECONDS * sample_rate * 2)
+                if len(audio) > max_bytes:
+                    audio.clear()
+                    await send({"type": "error", "error": "utterance is too long"})
+                continue
+
+            try:
+                command = json.loads(message.get("text") or "{}")
+            except json.JSONDecodeError:
+                await send({"type": "error", "error": "invalid JSON command"})
+                continue
+            kind = command.get("type")
+            if kind == "start":
+                if command.get("format", "pcm_s16le") != "pcm_s16le":
+                    await send({"type": "error", "error": "only pcm_s16le is supported"})
+                    continue
+                requested_rate = int(command.get("sample_rate", 16000))
+                if requested_rate != 16000 or int(command.get("channels", 1)) != 1:
+                    await send({"type": "error",
+                                "error": "send mono PCM16 audio at 16000 Hz"})
+                    continue
+                started = True
+                audio.clear()
+                await send({"type": "started"})
+            elif kind == "commit":
+                if not audio:
+                    await send({"type": "error", "error": "no audio to commit"})
+                    continue
+                client_id = str(command.get("utterance_id") or uuid.uuid4().hex)
+                await pending.put((bytes(audio), client_id))
+                audio.clear()
+            elif kind == "delete_voiceprints":
+                deleted = await asyncio.to_thread(
+                    SESSION_STORE.delete_voiceprints, session_id)
+                await send({"type": "voiceprints_deleted", "count": deleted})
+            elif kind == "end":
+                if audio:
+                    client_id = str(command.get("utterance_id") or uuid.uuid4().hex)
+                    await pending.put((bytes(audio), client_id))
+                    audio.clear()
+                await pending.join()
+                ended = await asyncio.to_thread(
+                    SESSION_STORE.end_session, session_id,
+                    delete_voiceprints=bool(command.get("delete_voiceprints", False)))
+                await send({"type": "session_ended", "session": ended})
+                break
+            elif kind == "ping":
+                await send({"type": "pong"})
+            else:
+                await send({"type": "error", "error": f"unknown command: {kind}"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        processor.cancel()
+        try:
+            await processor
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/v1/jobs")
