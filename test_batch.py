@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Test/smoke script for the WhisperX API.
+Test/smoke script for the Parascribe batch API.
 
 Usage
 -----
 # Endpoint-only checks (health + models), no audio needed:
-  python test_whisperx.py
+  python test_batch.py
 
 # Full end-to-end test with your own audio (best test — real speech/speakers):
-  python test_whisperx.py path/to/meeting.m4a
-  python test_whisperx.py path/to/meeting.m4a --num-speakers 3
+  python test_batch.py path/to/meeting.m4a
+  python test_batch.py path/to/meeting.m4a --num-speakers 3
 
 # No audio file handy? Auto-generate a 2-speaker clip (needs espeak-ng + ffmpeg):
-  python test_whisperx.py --make-sample
+  python test_batch.py --make-sample
 
-Server defaults to http://192.168.2.101:8357 (override with --url or WHISPERX_URL).
+Server defaults to http://192.168.2.101:8357 (override with --url or PARASCRIBE_URL).
 """
 import argparse
 import os
@@ -27,7 +27,7 @@ from pathlib import Path
 
 import requests
 
-DEFAULT_URL = os.environ.get("WHISPERX_URL", "http://192.168.2.101:8357")
+DEFAULT_URL = os.environ.get("PARASCRIBE_URL", "http://192.168.2.101:8357")
 
 PASS = "\033[92m✓\033[0m"
 FAIL = "\033[91m✗\033[0m"
@@ -53,7 +53,7 @@ def check_health(url):
         return True
     except Exception as e:
         print(f"{FAIL} Cannot reach {url}/health: {e}")
-        print("  Is the container up?  python3 whisperx_cluster.py ps")
+        print("  Is the container up?  python3 parascribe_cluster.py ps")
         return False
 
 
@@ -80,7 +80,7 @@ def make_sample():
         sys.exit("ffmpeg not found. Install it (sudo apt install ffmpeg) "
                  "or pass your own audio file.")
     espeak = shutil.which("espeak-ng") or shutil.which("espeak")
-    tmp = Path(tempfile.mkdtemp(prefix="whisperx_test_"))
+    tmp = Path(tempfile.mkdtemp(prefix="parascribe_test_"))
     a, b, out = tmp / "a.wav", tmp / "b.wav", tmp / "sample.wav"
     # Two different voices -> two distinguishable speakers.
     subprocess.run([espeak, "-v", "en-us+m3", "-s", "150",
@@ -191,7 +191,7 @@ def run_transcription(url, audio, num_speakers=None, min_speakers=None,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Test the WhisperX API")
+    ap = argparse.ArgumentParser(description="Test the Parascribe batch API")
     ap.add_argument("audio", nargs="?", help="audio file for a full end-to-end test")
     ap.add_argument("--url", default=DEFAULT_URL)
     ap.add_argument("--make-sample", action="store_true",

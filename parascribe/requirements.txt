@@ -5,3 +5,5 @@ whisperx==3.4.2
 # V2 uses Parakeet v3 INT8 on CPU for low-latency sentence/realtime commits.
 onnx-asr==0.12.0
 onnxruntime==1.30.0
+# Local Cohere GGUF runtime, matching Voikoro's locked version.
+transcribe-cpp==0.2.4

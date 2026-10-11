@@ -2,18 +2,19 @@
 
 **Scalable speaker-attributed speech transcription on your own GPUs.**
 
-Parascribe is a self-hosted service that turns audio into a **speaker-labeled
-transcript** (`Speaker 1:`, `Speaker 2:`, …) using
-[WhisperX](https://github.com/m-bain/whisperX) — Whisper `large-v3` for
-transcription, wav2vec2 for word-level alignment, and
-[pyannote](https://github.com/pyannote/pyannote-audio) for diarization — and
-**scales it across GPUs** with a process-replica architecture behind a single
-nginx gateway.
+Parascribe is a self-hosted service for batch transcription, sentence/realtime
+transcription, and speaker recognition within a conversation.
 
-The experimental v2 API adds sentence/realtime ingestion and session-local
-speaker voiceprints without changing the working v1 batch API. See
-[`README-v2.md`](README-v2.md) for its protocol, privacy model, and current
-limitations.
+| API | Transcription | Speaker processing |
+|---|---|---|
+| `/v1` batch | WhisperX / Whisper `large-v3`, with wav2vec2 alignment | pyannote diarization |
+| `/v2` sentences and streams | Parakeet v3 INT8, Cohere Transcribe Q8, or both | WeSpeaker session voiceprints |
+
+Process replicas share a single nginx gateway. The experimental v2 supports
+per-session voiceprint deletion and retains both model outputs in comparison
+mode. See [`README-v2.md`](README-v2.md) for setup and protocol details, and
+[`README-batch.md`](README-batch.md) for the v1 batch API. The performance study
+below describes the v1 WhisperX batch pipeline.
 
 It ships with the serving stack, a multi-GPU launcher, a client, a benchmark
 suite, and a short paper (`paper/`) that measures the whole thing.
@@ -52,9 +53,9 @@ extrapolating to **~1.9 min** on 4 GPUs (12 replicas). Model:
 ## Architecture
 
 ```
-clients ──HTTP──▶ nginx gateway (:8357) ──round-robin──▶  whisperx-0  ┐
-                        │                                  whisperx-1  ├─ one GPU
-                        │  GET /v1/jobs/<i>-… ─▶ replica i  whisperx-2  ┘
+clients ──HTTP──▶ nginx gateway (:8357) ──round-robin──▶  parascribe-0  ┐
+                        │                                  parascribe-1  ├─ one GPU
+                        │  GET /v1/jobs/<i>-… ─▶ replica i  parascribe-2  ┘
                         ▼
                  shared /data volume (transcripts)
 ```
@@ -78,8 +79,9 @@ cp .env.example .env
 $EDITOR .env          # set HUGGINGFACE_HUB_TOKEN=...
 # Accept the pyannote licenses once (links in .env.example).
 
-# 2a. Bring up the checked-in topology as-is (2 replicas + gateway)
-docker compose -p whisperx-cluster up -d --build
+# 2a. Build and bring up the checked-in topology (2 replicas + gateway)
+docker build -t parascribe-api:local ./parascribe
+docker compose -p parascribe-cluster up -d
 
 # 1b. Pre-download the model weights (optional but recommended).
 #     Only the libraries are baked into the image; weights are pulled on first
@@ -89,19 +91,32 @@ python3 fetch_models.py           # fetches whatever is missing, skips the rest
 python3 fetch_models.py --check   # report only; exit 1 if anything is absent
 
 # 2b. Or generate a topology for this machine's GPUs (recommended).
-#     Note: `up`/`gen` rewrite docker-compose.yml and whisperx-nginx.conf.
-REPLICAS=3 python3 whisperx_cluster.py up            # 3 replicas on one GPU
-python3 whisperx_cluster.py up --replicas 3 --gpus 0,1,2,3   # 12 replicas, 4 GPUs
-python3 whisperx_cluster.py up --replicas 3 --gpus 0,1 --dry-run   # preview + GPU check
+#     Note: `up`/`gen` rewrite docker-compose.yml and parascribe-nginx.conf.
+REPLICAS=3 python3 parascribe_cluster.py up            # 3 replicas on one GPU
+python3 parascribe_cluster.py up --replicas 3 --gpus 0,1,2,3   # 12 replicas, 4 GPUs
+python3 parascribe_cluster.py up --replicas 3 --gpus 0,1 --dry-run   # preview + GPU check
 ```
 
 The gateway listens on **`:8357`** (single endpoint, load-balanced). Manage the
-cluster with `whisperx_cluster.py {ps,down,urls}`.
+cluster with `parascribe_cluster.py {ps,down,urls}`.
+
+### Naming migration
+
+The shared deployment now uses `parascribe/`, `parascribe_cluster.py`,
+`parascribe-nginx.conf`, image `parascribe-api:local`, and compose project
+`parascribe-cluster`. Client settings are `PARASCRIBE_URL` / `PARASCRIBE_URLS`;
+GPU selection uses `PARASCRIBE_GPUS` / `PARASCRIBE_GPU`.
+
+The source directory rename preserves its runtime data under `parascribe/data/`.
+Existing containers keep their original names until explicitly replaced. Stop
+the old deployment before launching the renamed one on the same ports; this
+source change does not deploy or restart containers. Published paper commands
+and measurement metadata retain their historical names for reproducibility.
 
 ### Transcribe
 
 ```bash
-export WHISPERX_URL=http://localhost:8357
+export PARASCRIBE_URL=http://localhost:8357
 
 # One file (auto speaker count); saves <file>.transcript.txt next to the audio
 python3 transcribe.py meeting.m4a
@@ -166,7 +181,7 @@ be quoted on its own.
 
 ## Configuration
 
-Set in the compose `environment:` (or via `whisperx_cluster.py`):
+Set in the compose `environment:` (or via `parascribe_cluster.py`):
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -175,13 +190,13 @@ Set in the compose `environment:` (or via `whisperx_cluster.py`):
 | `DEFAULT_LANGUAGE` | `en` | empty = auto-detect |
 | `BATCH_SIZE` | `16` | lower on out-of-memory |
 | `WORKERS` | `1` | keep at 1 — threads don't help (see paper) |
-| `REPLICA_ID` | `0` | set per replica by `whisperx_cluster.py` |
+| `REPLICA_ID` | `0` | set per replica by `parascribe_cluster.py` |
 
-`whisperx_cluster.py` flags: `--replicas` (per GPU), `--gpus 0,1,2,3`,
+`parascribe_cluster.py` flags: `--replicas` (per GPU), `--gpus 0,1,2,3`,
 `--dry-run`, `--no-gpu-check`, `--base-port`, `--gateway-port`.
 
 Full HTTP API, build notes, and troubleshooting are in
-[`README-whisperx.md`](README-whisperx.md).
+[`README-batch.md`](README-batch.md).
 
 ---
 
@@ -212,17 +227,17 @@ benchmark if you are not using the manifest.
 ## Repository layout
 
 ```
-whisperx/server.py           FastAPI service: transcribe → align → diarize → relabel
-whisperx/Dockerfile          CUDA 12.8 + cuDNN 9 image (Blackwell-ready)
-whisperx_cluster.py          multi-GPU replica launcher + nginx gateway generator
+parascribe/server.py           FastAPI service: v1 batch + v2 sentence/session APIs
+parascribe/Dockerfile          CUDA 12.8 + cuDNN 9 image (Blackwell-ready)
+parascribe_cluster.py          multi-GPU replica launcher + nginx gateway generator
 fetch_models.py              pre-download model weights that are not cached yet
 transcribe.py                client (single file or batch)
 benchmark_transcribe.py      concurrency/scaling benchmark + capacity planning
-test_whisperx.py             endpoint + end-to-end smoke test
+test_batch.py             endpoint + end-to-end smoke test
 docker-compose.yml           replica + gateway stack (generated by the launcher)
 paper/                       LaTeX source + compiled PDF of the measurement study
 paper/measurements/          committed benchmark results, one directory per run
-README-whisperx.md           detailed API reference, build notes, troubleshooting
+README-batch.md           detailed API reference, build notes, troubleshooting
 ```
 
 ---

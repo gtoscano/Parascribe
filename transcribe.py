@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Client for the WhisperX API + optional summarization via your vLLM Qwen3 server.
+Client for the Parascribe batch API + optional summarization via your vLLM Qwen3 server.
 
 Handles one file or many. Two ways to spread many files across replicas:
 
   * Gateway (recommended): point --url at the nginx gateway (default :8357) and
     use --concurrency to keep several jobs in flight; the gateway round-robins
-    each to a replica. One endpoint, no URL juggling. See whisperx_cluster.py.
+    each to a replica. One endpoint, no URL juggling. See parascribe_cluster.py.
   * Direct pool (advanced): pass --urls with the replicas' direct URLs; files
     are round-robined and each replica runs one at a time (bypasses the gateway,
     handy for benchmarking individual replicas).
@@ -34,8 +34,8 @@ Examples
   python transcribe.py --summarize-file transcript.txt
 
 Endpoints (override with env or flags):
-  WHISPERX_URL   default http://localhost:8357   (nginx gateway; round-robins internally)
-  WHISPERX_URLS  comma-separated replica pool for direct round-robin; overrides WHISPERX_URL
+  PARASCRIBE_URL   default http://localhost:8357   (nginx gateway; round-robins internally)
+  PARASCRIBE_URLS  comma-separated replica pool for direct round-robin; overrides PARASCRIBE_URL
   VLLM_URL       default http://localhost:8355   (any OpenAI-compatible server,
                  local or remote; the summarizer is not tied to a given model)
   VLLM_MODEL     model id to summarize with; default is whichever the server
@@ -52,7 +52,7 @@ from pathlib import Path
 
 import requests
 
-WHISPERX_URL = os.environ.get("WHISPERX_URL", "http://localhost:8357")
+PARASCRIBE_URL = os.environ.get("PARASCRIBE_URL", "http://localhost:8357")
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8355")
 
 SUMMARY_PROMPT = """You are summarizing a transcript of a spoken conversation with
@@ -300,7 +300,7 @@ def process_one(audio, base_url, args, tag="", print_summary=False):
 
 
 def resolve_urls(args):
-    """Replica pool: --urls (or WHISPERX_URLS) wins, else the single --url."""
+    """Replica pool: --urls (or PARASCRIBE_URLS) wins, else the single --url."""
     if args.urls:
         return [u.strip().rstrip("/") for u in args.urls.split(",") if u.strip()]
     return [args.url.rstrip("/")]
@@ -361,7 +361,7 @@ def run_batch_direct(files, urls, args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="WhisperX transcribe, with optional LLM summarization")
+        description="Parascribe batch transcription, with optional LLM summarization")
     ap.add_argument("audio", nargs="*", help="audio/video file(s) to transcribe")
     ap.add_argument("--language", default="en")
     ap.add_argument("--no-diarize", action="store_true",
@@ -373,12 +373,12 @@ def main():
                     help="also summarize via the vLLM Qwen3 server")
     ap.add_argument("--summarize-file",
                     help="skip transcription; summarize this existing text file")
-    ap.add_argument("--url", default=WHISPERX_URL,
-                    help=f"WhisperX server URL (default {WHISPERX_URL}; "
-                         "also settable via WHISPERX_URL)")
-    ap.add_argument("--urls", default=os.environ.get("WHISPERX_URLS"),
+    ap.add_argument("--url", default=PARASCRIBE_URL,
+                    help=f"Parascribe server URL (default {PARASCRIBE_URL}; "
+                         "also settable via PARASCRIBE_URL)")
+    ap.add_argument("--urls", default=os.environ.get("PARASCRIBE_URLS"),
                     help="comma-separated replica pool for direct round-robin "
-                         "(env WHISPERX_URLS); overrides --url and bypasses the gateway")
+                         "(env PARASCRIBE_URLS); overrides --url and bypasses the gateway")
     ap.add_argument("--concurrency", type=int, default=3,
                     help="max jobs in flight when submitting many files to the "
                          "gateway (--url); set to the replica count (default 3). "

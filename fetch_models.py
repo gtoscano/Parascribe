@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Pre-download every model the WhisperX service needs, skipping whatever is
+Pre-download every model the Parascribe service needs, skipping whatever is
 already cached. Safe to re-run; nothing is re-fetched twice.
 
-Why this exists: only the *libraries* are baked into whisperx-api:local — the
+Why this exists: only the *libraries* are baked into parascribe-api:local — the
 weights are pulled on first use. Without a warm cache the first transcription of
 a fresh machine stalls for minutes inside the request, and a gated pyannote repo
 fails outright if HF_TOKEN was never accepted. Running this after a build (or
@@ -45,8 +45,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-IMAGE = "whisperx-api:local"
-BUILD_CONTEXT = "./whisperx"
+IMAGE = "parascribe-api:local"
+BUILD_CONTEXT = "./parascribe"
 HF_CACHE = Path.home() / ".cache" / "huggingface"
 TORCH_CACHE = Path.home() / ".cache" / "torch"
 
@@ -174,7 +174,7 @@ def _have_image() -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Download WhisperX model weights that are not cached yet.")
+        description="Download Parascribe model weights that are not cached yet.")
     ap.add_argument("--check", action="store_true",
                     help="report what is missing without downloading; "
                          "exit 1 if anything is absent")

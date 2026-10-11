@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-WhisperX transcription + speaker-diarization API.
+Parascribe transcription and session speaker-recognition API.
 
-Pipeline per request:  transcribe (Whisper large-v3) -> word-align -> diarize
-(pyannote) -> assign words to speakers -> relabel SPEAKER_00 as "Speaker 1".
+V1 batch: WhisperX transcription -> alignment -> pyannote diarization.
+V2 sentences/streams: Parakeet and/or Cohere -> session-local WeSpeaker matching.
 
-Jobs run on a single background worker (the GPU does one at a time). Results are
+Jobs run on the configured background workers. Results are
 written to /data/out/<job_id>/ so you can also retrieve transcripts as files.
 
 Endpoints:
@@ -48,6 +48,10 @@ from pydantic import BaseModel, Field
 
 from sentence_asr import DEFAULT_MODEL as DEFAULT_SENTENCE_ASR_MODEL
 from sentence_asr import ParakeetSentenceTranscriber
+from sentence_asr import (
+    ASR_MODES, COHERE_MODEL, CohereSentenceTranscriber,
+    run_sentence_models, validate_asr_request,
+)
 from session_store import SessionEnded, SessionNotFound, SessionStore
 from voiceprints import DEFAULT_MODEL as DEFAULT_VOICEPRINT_MODEL
 from voiceprints import VoiceprintExtractor
@@ -70,6 +74,11 @@ HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 SESSION_ASR_MODEL = os.environ.get(
     "SESSION_ASR_MODEL", DEFAULT_SENTENCE_ASR_MODEL)
 SESSION_ASR_MODEL_DIR = os.environ.get("SESSION_ASR_MODEL_DIR") or None
+SESSION_ASR_MODE = os.environ.get("SESSION_ASR_MODE", "parakeet")
+if SESSION_ASR_MODE not in ASR_MODES:
+    raise ValueError(f"Invalid SESSION_ASR_MODE: {SESSION_ASR_MODE}")
+COHERE_MODEL_PATH = os.environ.get("COHERE_MODEL_PATH", "")
+COHERE_BACKEND = os.environ.get("COHERE_BACKEND", "cpu")
 SESSION_ASR_QUANTIZATION = os.environ.get("SESSION_ASR_QUANTIZATION", "int8")
 SESSION_ASR_THREADS = int(os.environ.get(
     "SESSION_ASR_THREADS", str(max(1, (os.cpu_count() or 4) // 2))))
@@ -142,6 +151,7 @@ class ModelSet:
         self._align: Dict[str, Any] = {}
         self._diarize = None
         self._sentence_asr = None
+        self._cohere = None
         self._voiceprint = None
 
     def get_asr(self):
@@ -180,6 +190,13 @@ class ModelSet:
                 min_confidence=SESSION_ASR_MIN_CONFIDENCE,
             )
         return self._sentence_asr
+
+    def get_cohere(self):
+        if self._cohere is None:
+            self._cohere = CohereSentenceTranscriber(
+                model_path=COHERE_MODEL_PATH, backend=COHERE_BACKEND,
+                threads=SESSION_ASR_THREADS)
+        return self._cohere
 
 
 # ----------------------------------------------------------------------------
@@ -353,7 +370,7 @@ def _load_audio_16k(path: str) -> "Any":
 
 
 def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
-    """Transcribe with Parakeet and identify one speaker within a session."""
+    """Transcribe with selected engines and identify one speaker within a session."""
     pipeline_started = time.perf_counter()
     audio_path = job["audio_path"]
     language = job.get("language") or None
@@ -363,9 +380,15 @@ def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
     audio_seconds = len(audio) / 16000.0
 
     job["stage"] = "transcribe"
-    asr = _timed(job, "prepare_sentence_asr_model_s", models.get_sentence_asr)
-    text, lang = _timed(
-        job, "transcribe_s", asr.transcribe, audio, language=language)
+    transcription, engine_timings = _timed(
+        job, "transcribe_s", run_sentence_models, audio,
+        mode=job.get("asr_mode", SESSION_ASR_MODE), language=language,
+        get_parakeet=models.get_sentence_asr, get_cohere=models.get_cohere)
+    job["timings"].update(engine_timings)
+    # Retain both hypotheses even if the primary engine reports no speech.
+    job["result"] = {"transcription": transcription}
+    primary = transcription["outputs"][transcription["primary"]]
+    text, lang = primary["text"], primary["language"]
     if not text:
         raise ValueError("no speech was transcribed from this utterance")
 
@@ -402,6 +425,7 @@ def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
     )
     job["result"] = {
         **utterance,
+        "transcription": transcription,
         "speaker": {
             "id": speaker_id,
             "similarity": similarity,
@@ -540,7 +564,7 @@ async def _startup():
     # One thread per worker so their blocking run_transcription calls run
     # concurrently rather than contending for a shared executor's threads.
     _executor = ThreadPoolExecutor(max_workers=WORKERS,
-                                   thread_name_prefix="whisperx-worker")
+                                   thread_name_prefix="parascribe-worker")
     for i in range(WORKERS):
         asyncio.create_task(_worker(i, ModelSet(i)))
 
@@ -550,6 +574,8 @@ async def health():
     return {"status": "ok", "model": WHISPER_MODEL, "device": DEVICE,
             "diarization": bool(HF_TOKEN), "workers": WORKERS,
             "session_asr": SESSION_ASR_MODEL,
+            "session_asr_mode": SESSION_ASR_MODE,
+            "cohere_configured": bool(COHERE_MODEL_PATH and Path(COHERE_MODEL_PATH).is_file()),
             "voiceprints": True, "replica_id": REPLICA_ID}
 
 
@@ -561,6 +587,10 @@ async def models():
             "session_asr_model": SESSION_ASR_MODEL,
             "session_asr_quantization": SESSION_ASR_QUANTIZATION,
             "session_asr_device": "cpu",
+            "session_asr_modes": list(ASR_MODES),
+            "session_asr_default_mode": SESSION_ASR_MODE,
+            "cohere_model": COHERE_MODEL,
+            "cohere_backend": COHERE_BACKEND,
             "voiceprint_model": VOICEPRINT_MODEL,
             "voiceprint_similarity_threshold": VOICEPRINT_SIMILARITY_THRESHOLD,
             "replica_id": REPLICA_ID}
@@ -677,6 +707,7 @@ def _new_session_job(
     language: str | None,
     source: str,
     upload_save_s: float,
+    asr_mode: str = SESSION_ASR_MODE,
     job_id: str | None = None,
     future=None,
 ) -> Dict[str, Any]:
@@ -686,6 +717,7 @@ def _new_session_job(
     job = {
         "job_id": job_id,
         "kind": "session_utterance",
+        "asr_mode": asr_mode,
         "status": "queued",
         "stage": "queued",
         "filename": filename,
@@ -727,10 +759,12 @@ async def transcribe_sentence(
     session_id: str,
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
+    asr_mode: str = Form(SESSION_ASR_MODE),
 ):
     session = _session_or_404(session_id)
     if session["status"] != "active":
         raise HTTPException(409, "session has ended")
+    _validate_session_asr(asr_mode, language)
 
     suffix = Path(file.filename or "utterance").suffix or ".wav"
     job_id = f"{REPLICA_ID}-{uuid.uuid4().hex[:12]}"
@@ -752,6 +786,7 @@ async def transcribe_sentence(
         language=language, source="sentence",
         upload_save_s=round(time.perf_counter() - started, 6),
         job_id=job_id,
+        asr_mode=asr_mode,
     )
     await _queue.put(job["job_id"])
     return JSONResponse(_public(job), status_code=202)
@@ -786,6 +821,16 @@ def _write_pcm16_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
         output.writeframes(pcm)
 
 
+def _validate_session_asr(mode: str, language: str | None) -> None:
+    try:
+        validate_asr_request(mode, language)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    if mode in ("cohere", "compare"):
+        if not COHERE_MODEL_PATH or not Path(COHERE_MODEL_PATH).is_file():
+            raise HTTPException(503, "Cohere is not configured; set COHERE_MODEL_PATH to a local GGUF file")
+
+
 @app.websocket("/v2/sessions/{session_id}/stream")
 async def stream_session(ws: WebSocket, session_id: str):
     try:
@@ -803,6 +848,8 @@ async def stream_session(ws: WebSocket, session_id: str):
     sample_rate = 16000
     audio = bytearray()
     started = False
+    asr_mode = SESSION_ASR_MODE
+    language = None
 
     async def send(message: dict):
         async with send_lock:
@@ -814,7 +861,7 @@ async def stream_session(ws: WebSocket, session_id: str):
             if item is None:
                 pending.task_done()
                 return
-            pcm, client_utterance_id = item
+            pcm, client_utterance_id, item_mode, item_language = item
             job_id = f"{REPLICA_ID}-{uuid.uuid4().hex[:12]}"
             path = IN_DIR / f"{job_id}.wav"
             try:
@@ -823,7 +870,7 @@ async def stream_session(ws: WebSocket, session_id: str):
                 future = asyncio.get_running_loop().create_future()
                 job = _new_session_job(
                     session_id, path, filename=f"{client_utterance_id}.wav",
-                    language=None, source="realtime",
+                    language=item_language, source="realtime", asr_mode=item_mode,
                     upload_save_s=round(time.perf_counter() - write_started, 6),
                     job_id=job_id,
                     future=future,
@@ -878,15 +925,26 @@ async def stream_session(ws: WebSocket, session_id: str):
                     await send({"type": "error",
                                 "error": "send mono PCM16 audio at 16000 Hz"})
                     continue
+                requested_mode = command.get("asr_mode", SESSION_ASR_MODE)
+                requested_language = command.get("language") or None
+                try:
+                    _validate_session_asr(requested_mode, requested_language)
+                except HTTPException as error:
+                    await send({"type": "error", "error": error.detail})
+                    continue
+                if started:
+                    await send({"type": "error", "error": "stream already started"})
+                    continue
+                asr_mode, language = requested_mode, requested_language
                 started = True
                 audio.clear()
-                await send({"type": "started"})
+                await send({"type": "started", "asr_mode": asr_mode, "language": language})
             elif kind == "commit":
                 if not audio:
                     await send({"type": "error", "error": "no audio to commit"})
                     continue
                 client_id = str(command.get("utterance_id") or uuid.uuid4().hex)
-                await pending.put((bytes(audio), client_id))
+                await pending.put((bytes(audio), client_id, asr_mode, language))
                 audio.clear()
             elif kind == "delete_voiceprints":
                 deleted = await asyncio.to_thread(
@@ -895,7 +953,7 @@ async def stream_session(ws: WebSocket, session_id: str):
             elif kind == "end":
                 if audio:
                     client_id = str(command.get("utterance_id") or uuid.uuid4().hex)
-                    await pending.put((bytes(audio), client_id))
+                    await pending.put((bytes(audio), client_id, asr_mode, language))
                     audio.clear()
                 await pending.join()
                 ended = await asyncio.to_thread(

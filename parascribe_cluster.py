@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Launch WhisperX replicas across one or more GPUs behind an nginx gateway that
+Launch Parascribe replicas across one or more GPUs behind an nginx gateway that
 round-robins requests — a single endpoint that spreads load, with no client-side
 URL juggling.
 
-Why replicas (not threads): the pipeline (diarization, alignment,
+The original v1 batch benchmarks motivate the replica layout below; v2 models
+have different resource requirements and need separate measurements.
+
+Why replicas (not threads): the v1 pipeline (diarization, alignment,
 assign_word_speakers) is largely pure-Python CPU work that holds the GIL, so
 multiple worker *threads* in one process serialize on the GIL and only contend
 for the GPU. Separate *processes* each get their own interpreter and CUDA
@@ -29,20 +32,20 @@ Layout:
 
 Usage:
   # 3 replicas on one GPU (unchanged single-GPU behaviour)
-  REPLICAS=3 python3 whisperx_cluster.py up
+  REPLICAS=3 python3 parascribe_cluster.py up
 
   # 3 replicas per GPU across 4 GPUs = 12 replicas
-  python3 whisperx_cluster.py up --replicas 3 --gpus 0,1,2,3
+  python3 parascribe_cluster.py up --replicas 3 --gpus 0,1,2,3
 
-  python3 whisperx_cluster.py gen                  # just (re)write compose + nginx
-  python3 whisperx_cluster.py ps                   # status
-  python3 whisperx_cluster.py urls                 # print the gateway URL
-  python3 whisperx_cluster.py urls --direct        # direct replica URLs (CSV)
-  python3 whisperx_cluster.py down                 # stop + remove everything
+  python3 parascribe_cluster.py gen                  # just (re)write compose + nginx
+  python3 parascribe_cluster.py ps                   # status
+  python3 parascribe_cluster.py urls                 # print the gateway URL
+  python3 parascribe_cluster.py urls --direct        # direct replica URLs (CSV)
+  python3 parascribe_cluster.py down                 # stop + remove everything
 
 Env vars (override defaults):
   REPLICAS      replicas PER GPU              (default 2)
-  WHISPERX_GPUS comma-separated GPU indices   (default "1"; falls back to WHISPERX_GPU)
+  PARASCRIBE_GPUS comma-separated GPU indices   (default "1"; falls back to PARASCRIBE_GPU)
   GATEWAY_PORT  host port for the gateway     (default 8357)
   BASE_PORT     first direct replica port     (default 8360)
 """
@@ -53,12 +56,12 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-BUILD_CONTEXT = "./whisperx"
-IMAGE = "whisperx-api:local"
+BUILD_CONTEXT = "./parascribe"
+IMAGE = "parascribe-api:local"
 GEN_FILE = HERE / "docker-compose.yml"
-NGINX_FILE = HERE / "whisperx-nginx.conf"
-NETWORK = "whisperx-net"
-PROJECT = "whisperx-cluster"  # compose project name, isolates these containers
+NGINX_FILE = HERE / "parascribe-nginx.conf"
+NETWORK = "parascribe-net"
+PROJECT = "parascribe-cluster"  # compose project name, isolates these containers
 
 
 def _env_int(name: str, default: int) -> int:
@@ -69,7 +72,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _default_gpus() -> str:
-    return os.environ.get("WHISPERX_GPUS") or os.environ.get("WHISPERX_GPU") or "1"
+    return os.environ.get("PARASCRIBE_GPUS") or os.environ.get("PARASCRIBE_GPU") or "1"
 
 
 def parse_gpus(spec: str):
@@ -129,7 +132,7 @@ def verify_gpus(per_gpu: int, gpus) -> bool:
     if missing:
         print(f"! requested GPU(s) {missing} not found. "
               f"Available: {sorted(present)}.")
-        print("  Fix --gpus (or WHISPERX_GPUS), or pass --no-gpu-check to override.")
+        print("  Fix --gpus (or PARASCRIBE_GPUS), or pass --no-gpu-check to override.")
         return False
     # Soft memory advisory (does not block).
     need = per_gpu * ESTIMATED_REPLICA_MIB
@@ -146,9 +149,9 @@ def verify_gpus(per_gpu: int, gpus) -> bool:
 def _replica_block(idx: int, host_port: int, gpu: str) -> str:
     """One replica service. WORKERS=1, a REPLICA_ID for gateway routing, pinned
     to physical GPU `gpu` (remapped to cuda:0 inside the container)."""
-    return f"""  whisperx-{idx}:
+    return f"""  parascribe-{idx}:
     image: {IMAGE}
-    container_name: whisperx-{idx}
+    container_name: parascribe-{idx}
     ports:
       - "{host_port}:8000"
     dns:
@@ -187,6 +190,9 @@ def _replica_block(idx: int, host_port: int, gpu: str) -> str:
       - SESSION_ASR_MODEL=nemo-parakeet-tdt-0.6b-v3
       - SESSION_ASR_QUANTIZATION=int8
       - SESSION_ASR_THREADS=8
+      - SESSION_ASR_MODE=${{SESSION_ASR_MODE:-parakeet}}
+      - COHERE_MODEL_PATH=/models/cohere-transcribe-03-2026-Q8_0.gguf
+      - COHERE_BACKEND=${{COHERE_BACKEND:-cpu}}
       # V2 speaker embeddings are compared only inside one session. These
       # thresholds must be calibrated against representative recordings.
       - VOICEPRINT_MODEL=pyannote/wespeaker-voxceleb-resnet34-LM
@@ -201,7 +207,8 @@ def _replica_block(idx: int, host_port: int, gpu: str) -> str:
     volumes:
       - ~/.cache/huggingface:/workspace/.cache/huggingface
       - ~/.cache/torch:/root/.cache/torch
-      - ./whisperx/data:/data
+      - ./parascribe/data:/data
+      - ./models:/models:ro
     networks:
       - {NETWORK}
     restart: unless-stopped
@@ -216,11 +223,11 @@ def _replica_block(idx: int, host_port: int, gpu: str) -> str:
 
 def _gateway_block(gateway_port: int, total: int) -> str:
     depends = "\n".join(
-        f"      whisperx-{i}:\n        condition: service_healthy"
+        f"      parascribe-{i}:\n        condition: service_healthy"
         for i in range(total))
-    return f"""  whisperx-gateway:
+    return f"""  parascribe-gateway:
     image: nginx:alpine
-    container_name: whisperx-gateway
+    container_name: parascribe-gateway
     ports:
       - "{gateway_port}:8000"
     volumes:
@@ -261,12 +268,12 @@ def generate_compose(per_gpu: int, base_port: int, gateway_port: int,
                      gpus) -> str:
     total = total_replicas(per_gpu, gpus)
     header = (
-        "# AUTO-GENERATED by whisperx_cluster.py — do not edit by hand.\n"
+        "# AUTO-GENERATED by parascribe_cluster.py — do not edit by hand.\n"
         f"# {total} replica(s) = {per_gpu}/GPU x {len(gpus)} GPU(s) "
         f"{gpus}, behind an nginx gateway.\n"
         f"# gateway -> :{gateway_port} (clients)   replicas -> "
         f":{base_port}..{base_port + total - 1} (direct)\n"
-        "# Regenerate:  python3 whisperx_cluster.py gen\n"
+        "# Regenerate:  python3 parascribe_cluster.py gen\n"
         f"# Build the image first:  docker build -t {IMAGE} {BUILD_CONTEXT}\n"
         "networks:\n"
         f"  {NETWORK}:\n"
@@ -281,21 +288,21 @@ def generate_compose(per_gpu: int, base_port: int, gateway_port: int,
 
 def generate_nginx(total: int) -> str:
     upstream = "\n".join(
-        f"        server whisperx-{i}:8000 max_fails=0;" for i in range(total)
+        f"        server parascribe-{i}:8000 max_fails=0;" for i in range(total)
     )
-    return f"""# AUTO-GENERATED by whisperx_cluster.py — do not edit by hand.
+    return f"""# AUTO-GENERATED by parascribe_cluster.py — do not edit by hand.
 # One worker so round-robin state is global and distribution is even (each
 # nginx worker keeps its own RR counter; multiple workers skew small samples).
 # A single worker easily handles this proxy's request rate.
 worker_processes 1;
 events {{ worker_connections 1024; }}
 http {{
-    # Docker's embedded DNS, so `whisperx-<n>` resolves at request time.
+    # Docker's embedded DNS, so `parascribe-<n>` resolves at request time.
     resolver 127.0.0.11 valid=10s ipv6=off;
     access_log /dev/stdout;
     error_log  /dev/stderr;
 
-    upstream whisperx_pool {{
+    upstream parascribe_pool {{
 {upstream}
     }}
 
@@ -318,16 +325,16 @@ http {{
         listen 8000;
 
         # Job status/results -> the replica that owns the job (numeric prefix
-        # in the id, e.g. /v1/jobs/2-abc... -> whisperx-2). Variable upstream
+        # in the id, e.g. /v1/jobs/2-abc... -> parascribe-2). Variable upstream
         # is resolved via the embedded DNS above.
         location ~ ^/v1/jobs/(?<rid>[0-9]+)- {{
-            set $backend whisperx-$rid:8000;
+            set $backend parascribe-$rid:8000;
             proxy_pass http://$backend;
         }}
 
         # Submit + health + models + job list -> round-robin the pool.
         location / {{
-            proxy_pass http://whisperx_pool;
+            proxy_pass http://parascribe_pool;
         }}
     }}
 }}
@@ -339,7 +346,7 @@ def _print_layout(per_gpu: int, base_port: int, gateway_port: int, gpus,
     total = total_replicas(per_gpu, gpus)
     print(f"{prefix}{total} replica(s) = {per_gpu}/GPU x {len(gpus)} GPU(s) {gpus}")
     for g, idxs in gpu_map(per_gpu, gpus).items():
-        names = ", ".join(f"whisperx-{i}" for i in idxs)
+        names = ", ".join(f"parascribe-{i}" for i in idxs)
         print(f"  GPU {g}: {names}")
     print(f"  gateway  -> {gateway_url(gateway_port)}")
     print(f"  direct   -> :{base_port}..{base_port + total - 1}")
@@ -390,7 +397,7 @@ def cmd_up(per_gpu, base_port, gateway_port, gpus,
           f"{len(gpus)} GPU(s)):\n  {gw}")
     print("Point the client at the gateway — one endpoint, load-balanced:")
     print(f"  python3 transcribe.py *.m4a --url {gw} --concurrency {total}")
-    print(f"  (or: export WHISPERX_URL={gw})")
+    print(f"  (or: export PARASCRIBE_URL={gw})")
     print("\nDirect replica URLs (for benchmarking individual replicas):")
     print(f"  {','.join(directs)}")
     return 0
@@ -408,7 +415,7 @@ def cmd_ps(per_gpu, base_port, gateway_port, gpus) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Manage WhisperX replicas across GPUs behind an nginx gateway.",
+        description="Manage Parascribe replicas across GPUs behind an nginx gateway.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__)
     ap.add_argument("action", choices=["up", "down", "gen", "ps", "urls"],
@@ -418,8 +425,8 @@ def main() -> int:
                     help="replicas PER GPU (env REPLICAS, default 2); "
                          "total = replicas x number of --gpus")
     ap.add_argument("--gpus", default=_default_gpus(),
-                    help="comma-separated GPU indices (env WHISPERX_GPUS / "
-                         "WHISPERX_GPU, default '1'), e.g. 0,1,2,3")
+                    help="comma-separated GPU indices (env PARASCRIBE_GPUS / "
+                         "PARASCRIBE_GPU, default '1'), e.g. 0,1,2,3")
     ap.add_argument("--base-port", type=int, default=_env_int("BASE_PORT", 8360),
                     help="first direct replica host port (env BASE_PORT, default 8360)")
     ap.add_argument("--gateway-port", type=int,

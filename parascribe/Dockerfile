@@ -1,4 +1,4 @@
-# WhisperX API image — built for Blackwell (RTX PRO 6000 / sm_120).
+# Parascribe API image — batch and sentence/realtime engines.
 # Base provides torch 2.7 + CUDA 12.8 + cuDNN 9, which CTranslate2/faster-whisper
 # need for Blackwell. Do NOT let pip downgrade torch (whisperx pulls it in).
 FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime

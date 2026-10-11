@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Load/scaling benchmark for the WhisperX transcription server.
+Load/scaling benchmark for the Parascribe batch transcription server.
 
 Goal
 ----
@@ -19,7 +19,7 @@ each concurrency level:
 
 IMPORTANT — how this server behaves
 -----------------------------------
-whisperx/server.py runs a SINGLE background worker and holds a global lock
+parascribe/server.py runs a SINGLE background worker and holds a global lock
 (`_models_lock`) around all GPU work, so jobs are processed ONE AT A TIME. Sending
 10 files at once just fills the queue; they still run sequentially on the GPU.
 
@@ -50,7 +50,7 @@ Output:
   companion <name>_jobs.csv containing every successful job's raw timings.
 
 Env / flags:
-  WHISPERX_URL   default http://localhost:8357   (override with --url)
+  PARASCRIBE_URL   default http://localhost:8357   (override with --url)
 """
 import argparse
 import csv
@@ -69,7 +69,7 @@ from pathlib import Path
 
 import requests
 
-WHISPERX_URL = os.environ.get("WHISPERX_URL", "http://localhost:8357")
+PARASCRIBE_URL = os.environ.get("PARASCRIBE_URL", "http://localhost:8357")
 DEFAULT_AUDIO = "testing_audio/dataset/ami/ES2005a.wav"  # ~478s, 4 speakers, smallest AMI
 SERVER_TIMING_KEYS = [
     "upload_save_s", "queue_wait_s", "load_audio_s", "prepare_asr_model_s",
@@ -306,7 +306,7 @@ class ContainerSampler(threading.Thread):
     slower clock rather than blocking the main sampler.
     """
 
-    def __init__(self, name_filter="whisperx", interval: float = 2.0):
+    def __init__(self, name_filter="parascribe", interval: float = 2.0):
         super().__init__(daemon=True)
         self.name_filter = name_filter
         self.interval = interval
@@ -378,7 +378,7 @@ def submit_and_wait(audio_path: Path, num_speakers, language, diarize,
 
     The whole job (submit + poll) stays on one `base_url`, because the job
     registry is per-replica: you must poll the replica you submitted to."""
-    base_url = base_url or WHISPERX_URL
+    base_url = base_url or PARASCRIBE_URL
     t_submit = time.time()
     data = {"language": language, "diarize": str(diarize).lower()}
     if num_speakers:
@@ -607,9 +607,9 @@ def run_level(concurrency, audio_path, audio_dur, args, sampler, idle_mem, urls,
 
 
 def main():
-    global WHISPERX_URL
+    global PARASCRIBE_URL
     ap = argparse.ArgumentParser(
-        description="Concurrency/scaling benchmark for the WhisperX server",
+        description="Concurrency/scaling benchmark for the Parascribe server",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--audio", default=DEFAULT_AUDIO,
                     help="audio file to submit repeatedly")
@@ -623,12 +623,12 @@ def main():
     ap.add_argument("--no-diarize", action="store_true",
                     help="skip speaker diarization")
     ap.add_argument("--gpu-index", type=int, default=1,
-                    help="physical GPU index the WhisperX container uses")
+                    help="physical GPU index the Parascribe container uses")
     ap.add_argument("--sample-interval", type=float, default=0.5,
                     help="seconds between resource samples")
     ap.add_argument("--container-interval", type=float, default=2.0,
                     help="seconds between per-container `docker stats` samples")
-    ap.add_argument("--container-filter", default="whisperx",
+    ap.add_argument("--container-filter", default="parascribe",
                     help="substring matching the container names to attribute "
                          "CPU/RAM to")
     ap.add_argument("--no-container-stats", action="store_true",
@@ -643,21 +643,21 @@ def main():
                          "run-to-run statistics")
     ap.add_argument("--warmup", action="store_true",
                     help="run one throwaway job first (loads models / warms caches)")
-    ap.add_argument("--url", default=WHISPERX_URL, help="WhisperX server URL")
-    ap.add_argument("--urls", default=os.environ.get("WHISPERX_URLS"),
+    ap.add_argument("--url", default=PARASCRIBE_URL, help="Parascribe server URL")
+    ap.add_argument("--urls", default=os.environ.get("PARASCRIBE_URLS"),
                     help="comma-separated replica URLs to round-robin across "
-                         "(env WHISPERX_URLS). Overrides --url. Use with "
-                         "whisperx_cluster.py to measure real parallelism.")
+                         "(env PARASCRIBE_URLS). Overrides --url. Use with "
+                         "parascribe_cluster.py to measure real parallelism.")
     ap.add_argument("--out", default=None,
                     help="CSV output path (default benchmark_<ts>.csv)")
     args = ap.parse_args()
 
-    # Replica pool: --urls (or WHISPERX_URLS) wins, else the single --url.
+    # Replica pool: --urls (or PARASCRIBE_URLS) wins, else the single --url.
     if args.urls:
         urls = [u.strip().rstrip("/") for u in args.urls.split(",") if u.strip()]
     else:
         urls = [args.url.rstrip("/")]
-    WHISPERX_URL = urls[0]  # default target for helpers that take no base_url
+    PARASCRIBE_URL = urls[0]  # default target for helpers that take no base_url
 
     audio_path = Path(args.audio)
     if not audio_path.exists():
@@ -950,10 +950,10 @@ def _provenance(args, urls, audio_path, audio_dur, gpu_name, gpu_total,
         },
         "service": {
             "urls": urls,
-            "image_id": _sh(["docker", "image", "inspect", "whisperx-api:local",
+            "image_id": _sh(["docker", "image", "inspect", "parascribe-api:local",
                              "--format", "{{.Id}}"]),
             "image_created": _sh(["docker", "image", "inspect",
-                                  "whisperx-api:local", "--format",
+                                  "parascribe-api:local", "--format",
                                   "{{.Created}}"]),
         },
         "workload": {
