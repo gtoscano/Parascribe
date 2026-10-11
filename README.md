@@ -16,6 +16,10 @@ mode. See [`README-v2.md`](README-v2.md) for setup and protocol details, and
 [`README-batch.md`](README-batch.md) for the v1 batch API. The performance study
 below describes the v1 WhisperX batch pipeline.
 
+For an interactive v2 test, open `/v2/test` on the running service. The
+[browser tester instructions](README-v2.md#browser-tester) cover uploads,
+microphone streaming, model comparisons, and session voiceprint deletion.
+
 It ships with the serving stack, a multi-GPU launcher, a client, a benchmark
 suite, and a short paper (`paper/`) that measures the whole thing.
 

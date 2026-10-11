@@ -14,7 +14,51 @@ and/or Cohere; WeSpeaker handles its voice signatures separately. V2 job polling
 also uses the existing `/v1/jobs` routes, which are shared job infrastructure,
 not a choice of transcription model.
 
-## Selecting and comparing transcription models
+## Browser tester
+
+After starting the service, open **http://localhost:8357/v2/test**. Parascribe
+serves the HTML and JavaScript itself; no separate frontend server or desktop
+app is required.
+
+```bash
+docker build -t parascribe-api:local ./parascribe
+python3 parascribe_cluster.py up --replicas 1
+```
+
+1. Create a session with speaker recognition enabled, or paste an existing
+   session ID and open it. Session IDs are shown on the page for reconnection.
+2. Choose Parakeet, Cohere, or Compare both. Select English or Spanish (or
+   another listed language); Cohere requires a language and configured weights.
+3. Upload a single-speaker audio file, or start the microphone, speak, and click
+   **Send sentence**. The microphone stays on. **Stop microphone** submits the
+   remaining audio. A 55-second automatic boundary prevents oversized commits.
+4. Read the transcript, session speaker ID, voice similarity, and—in comparison
+   mode—both transcripts and inference timings. These are observations, not an
+   accuracy benchmark. For voice matching, try several seconds of clear speech
+   from each person, one person at a time.
+5. Delete signatures, or end the session with **Delete voice signatures when
+   ending** selected (the tester's default). Transcripts are retained. Download
+   results exports session history plus the model comparisons collected by the
+   current page; reloading recovers primary transcripts, not past comparisons.
+
+The microphone requires HTTPS or a localhost origin. If Parascribe runs on a
+remote machine, use your HTTPS reverse proxy or forward its port:
+
+```bash
+ssh -L 8357:localhost:8357 your-user@your-server
+```
+
+Then open the localhost URL in your own browser. HTTP over a LAN IP can be used
+for file uploads, but browsers generally block microphone capture there. Serve
+the tester through Parascribe rather than opening the HTML as `file://`; the
+same-origin API and WebSocket requests avoid CORS configuration.
+
+The tester converts microphone input to mono 16 kHz PCM16 with an AudioWorklet.
+Sentence boundaries are manual; automatic speech/silence detection remains
+future work. Closing the page stops microphone capture and disconnects, but
+does not end the session or delete its signatures: use the explicit controls.
+
+## Model modes
 
 Both REST sentence uploads and WebSocket streams accept `asr_mode`:
 

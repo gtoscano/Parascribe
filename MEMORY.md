@@ -12,5 +12,6 @@ Recorded 2026-10-10.
 - V2 work was committed as `3f5aea3` on `feature/v2-session-voiceprints`. The implementation uses the same project with versioned APIs.
 - User requested generic service naming to avoid confusing deployment infrastructure with the WhisperX model (2026-10-11). Source directory is `parascribe/`, launcher `parascribe_cluster.py`, nginx config `parascribe-nginx.conf`, image `parascribe-api:local`, compose project `parascribe-cluster`, and client environment variables `PARASCRIBE_URL` / `PARASCRIBE_URLS`. V1 reference is `README-batch.md` and smoke client is `test_batch.py`. Actual WhisperX library references remain for v1. Historical paper artifacts keep their original names.
 - Current WebSocket streaming emits final sentence results after explicit client commits. Automatic VAD/end-of-sentence detection and speaker-threshold calibration remain follow-up work.
+- A browser tester is served at `/v2/test`, with source under `parascribe/web/`. It supports session creation/reconnection, audio uploads, manual microphone sentence commits, all ASR modes, result export, and voiceprint deletion. Microphone use needs HTTPS or localhost (an SSH tunnel works for remote testing).
 
 Read this file when continuing Parascribe model or session work. Verify the current code and branch before treating implementation details as current.

@@ -35,6 +35,7 @@ RUN printf 'torch==2.7.1\ntorchaudio==2.7.1\nnumpy<2.2\n' > /tmp/constraints.txt
         "huggingface_hub==0.34.4" "transformers==4.48.3"
 
 COPY server.py sentence_asr.py session_store.py voiceprints.py /app/
+COPY web /app/web
 
 EXPOSE 8000
 

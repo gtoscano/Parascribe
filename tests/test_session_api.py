@@ -15,6 +15,16 @@ import server  # noqa: E402
 
 
 class SessionApiTest(unittest.TestCase):
+    def test_browser_tester_assets_are_served_from_the_api(self):
+        with TestClient(server.app) as client:
+            page = client.get("/v2/test")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("/v2/test/client.js", page.text)
+            for name in ("client.js", "pcm-worklet.js"):
+                asset = client.get(f"/v2/test/{name}")
+                self.assertEqual(asset.status_code, 200)
+                self.assertIn("javascript", asset.headers["content-type"])
+
     def test_sentence_rejects_invalid_mode_and_missing_cohere_language(self):
         with TestClient(server.app) as client:
             session_id = client.post("/v2/sessions", json={}).json()["session_id"]

@@ -43,7 +43,7 @@ from fastapi import (
     FastAPI, File, Form, HTTPException, UploadFile, WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from sentence_asr import DEFAULT_MODEL as DEFAULT_SENTENCE_ASR_MODEL
@@ -449,6 +449,23 @@ _queue: "asyncio.Queue[str]" = None  # set on startup
 _executor: "ThreadPoolExecutor" = None  # set on startup
 
 app = FastAPI(title="Parascribe API", version="2.0")
+
+
+@app.get("/v2/test", include_in_schema=False)
+async def browser_test_page():
+    return FileResponse(Path(__file__).parent / "web" / "index.html")
+
+
+@app.get("/v2/test/client.js", include_in_schema=False)
+async def browser_test_client():
+    return FileResponse(Path(__file__).parent / "web" / "client.js",
+                        media_type="text/javascript")
+
+
+@app.get("/v2/test/pcm-worklet.js", include_in_schema=False)
+async def browser_test_worklet():
+    return FileResponse(Path(__file__).parent / "web" / "pcm-worklet.js",
+                        media_type="text/javascript")
 
 
 def _now() -> str:
