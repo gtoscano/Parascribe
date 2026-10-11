@@ -20,10 +20,94 @@ class SessionApiTest(unittest.TestCase):
             page = client.get("/v2/test")
             self.assertEqual(page.status_code, 200)
             self.assertIn("/v2/test/client.js", page.text)
-            for name in ("client.js", "pcm-worklet.js"):
+            for name in ("client.js", "pcm-worklet.js", "streaming.js"):
                 asset = client.get(f"/v2/test/{name}")
                 self.assertEqual(asset.status_code, 200)
                 self.assertIn("javascript", asset.headers["content-type"])
+
+    def test_live_preview_is_ephemeral_and_final_is_stored_once(self):
+        import numpy as np
+        from test_sentence_asr import FakeTranscriber
+
+        decoder = FakeTranscriber("parakeet-test", "Words as I speak")
+        with patch.object(server.ModelSet, "get_sentence_asr", return_value=decoder), \
+                patch.object(server.ModelSet, "get_voiceprint") as voiceprint, \
+                patch.object(server, "_load_audio_16k", return_value=np.zeros(16000)), \
+                TestClient(server.app) as client:
+            session_id = client.post("/v2/sessions", json={"capture_voiceprints": True}).json()["session_id"]
+            jobs_before = set(server.JOBS)
+            with client.websocket_connect(f"/v2/sessions/{session_id}/stream") as socket:
+                socket.receive_json()
+                socket.send_json({"type": "start", "partials": True})
+                socket.receive_json()
+                socket.send_bytes(b"\0\0" * 16000)
+                socket.send_json({"type": "preview", "utterance_id": "one"})
+                draft = socket.receive_json()
+                self.assertEqual(draft["type"], "partial")
+                self.assertEqual(draft["client_utterance_id"], "one")
+                self.assertTrue(draft["provisional"])
+                self.assertEqual(draft["speaker_status"], "pending")
+                self.assertEqual(set(server.JOBS), jobs_before)
+                self.assertEqual(client.get(f"/v2/sessions/{session_id}").json()["utterance_count"], 0)
+                voiceprint.assert_not_called()
+                # Disable capture before finalization: the preview above must
+                # not have extracted a signature even while capture was on.
+                client.delete(f"/v2/sessions/{session_id}/voiceprints")
+                socket.send_json({"type": "commit", "utterance_id": "one"})
+                self.assertEqual(socket.receive_json()["type"], "utterance_queued")
+                self.assertEqual(socket.receive_json()["type"], "utterance")
+                self.assertEqual(client.get(f"/v2/sessions/{session_id}").json()["utterance_count"], 1)
+                socket.send_json({"type": "end", "delete_voiceprints": True})
+                self.assertEqual(socket.receive_json()["type"], "session_ended")
+
+    def test_discard_and_preview_opt_in(self):
+        with TestClient(server.app) as client:
+            session_id = client.post("/v2/sessions", json={}).json()["session_id"]
+            with client.websocket_connect(f"/v2/sessions/{session_id}/stream") as socket:
+                socket.receive_json()
+                socket.send_json({"type": "start"})
+                socket.receive_json()
+                socket.send_bytes(b"\0\0" * 16000)
+                socket.send_json({"type": "preview"})
+                self.assertEqual(socket.receive_json()["type"], "partial_skipped")
+                socket.send_json({"type": "discard"})
+                socket.send_json({"type": "commit"})
+                self.assertEqual(socket.receive_json()["error"], "no audio to commit")
+                socket.send_json({"type": "end", "delete_voiceprints": True})
+                self.assertEqual(socket.receive_json()["type"], "session_ended")
+
+    def test_commit_invalidates_in_flight_partial(self):
+        import threading
+        import numpy as np
+        from test_sentence_asr import FakeTranscriber
+
+        entered, release = threading.Event(), threading.Event()
+        def slow_preview(item, models):
+            entered.set()
+            release.wait(timeout=10)
+            return {"primary": "parakeet", "outputs": {"parakeet": {"text": "stale"}}}
+
+        with patch.object(server, "run_preview", side_effect=slow_preview), \
+                patch.object(server.ModelSet, "get_sentence_asr", return_value=FakeTranscriber("test", "Final")), \
+                patch.object(server, "_load_audio_16k", return_value=np.zeros(16000)), \
+                TestClient(server.app) as client:
+            session_id = client.post("/v2/sessions", json={"capture_voiceprints": False}).json()["session_id"]
+            try:
+                with client.websocket_connect(f"/v2/sessions/{session_id}/stream") as socket:
+                    socket.receive_json()
+                    socket.send_json({"type": "start", "partials": True})
+                    socket.receive_json()
+                    socket.send_bytes(b"\0\0" * 16000)
+                    socket.send_json({"type": "preview", "utterance_id": "old"})
+                    self.assertTrue(entered.wait(timeout=5))
+                    socket.send_json({"type": "commit", "utterance_id": "old"})
+                    self.assertEqual(socket.receive_json()["type"], "utterance_queued")
+                    release.set()
+                    self.assertEqual(socket.receive_json()["type"], "utterance")
+                    socket.send_json({"type": "end"})
+                    self.assertEqual(socket.receive_json()["type"], "session_ended")
+            finally:
+                release.set()
 
     def test_sentence_rejects_invalid_mode_and_missing_cohere_language(self):
         with TestClient(server.app) as client:

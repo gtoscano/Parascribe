@@ -27,6 +27,10 @@
     th { font-size: .85rem; color: #526963; } .table-wrap { overflow-x: auto; }
     article p { white-space: pre-wrap; overflow-wrap: anywhere; }
     #events { max-height: 160px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82rem; }
+    [hidden] { display: none !important; }
+    .speaker { display: inline-block; padding: 4px 12px; border-radius: 16px; background: #e0f1ec; font-size: 1.1rem; }
+    .draft { border: 2px dashed #b7c9c0; } .draft p { font-size: 1.2rem; }
+    button[aria-selected=true] { background: #17614e; color: white; }
     @media (max-width: 600px) { body { padding: 14px 12px; } section, article { padding: 16px; } .row > label { width: 100%; } input[type=text] { min-width: 0; } }
   </style>
 </head>
@@ -34,7 +38,7 @@
   <header>
     <small>PARASCRIBE / V2</small>
     <h1>Try a conversation</h1>
-    <p class="muted">Upload one speaker’s audio, or use your microphone and send each sentence. Compare the two transcription models on the same audio.</p>
+    <p class="muted">Transcribe automatically as you speak, or send sentences manually. Compare models and recognize speakers within a conversation.</p>
   </header>
   <div id="status" role="status" aria-live="polite">Checking the server…</div>
   <section>
@@ -58,12 +62,18 @@
     </div>
     <p class="muted">Cohere and comparison mode need a selected language. First use may take longer while models load.</p>
     <div class="row">
+      <label>Microphone behavior<select id="delivery"><option value="manual">Manual sentences</option><option value="auto">Automatic sentences on pause</option><option value="live">Live partial text + automatic sentences</option></select></label>
+      <label>Pause to finish<select id="pause"><option value="0.6">0.6 seconds</option><option value="0.8" selected>0.8 seconds</option><option value="1.2">1.2 seconds</option><option value="1.8">1.8 seconds</option></select></label>
+      <label>Speech sensitivity<select id="sensitivity"><option value="0.008">Quiet voice</option><option value="0.015" selected>Normal</option><option value="0.03">Noisy room</option></select></label>
+    </div>
+    <p class="muted">Live mode periodically re-decodes the current sentence, so drafts can change and use more compute. Speaker identification happens only on the final sentence. Pause detection is energy-based; use one speaker at a time.</p>
+    <div class="row">
       <button id="start" class="primary">Start microphone</button>
       <button id="commit">Send sentence</button>
       <button id="stop">Stop microphone</button>
     </div>
     <p id="activity" class="muted">Microphone off · 0 pending sentences</p>
-    <small>Click “Send sentence” after speaking. The microphone stays on for the next sentence. “Stop” sends the remaining audio. Long utterances are automatically sent at 55 seconds.</small>
+    <small>“Send sentence” always works. Automatic/live modes finalize on a pause or at 20 seconds; manual mode limits chunks to 55 seconds. “Stop” sends remaining speech. Stop and wait for results before changing modes.</small>
   </section>
   <section>
     <h2>3. Results and retention</h2>
@@ -75,7 +85,23 @@
       <button id="end" class="danger">End session</button>
     </div>
     <p class="muted">Deleting signatures keeps the transcript and disables further signature capture for this session. Uploaded audio is removed by the server after processing.</p>
-    <div id="results" aria-live="polite"><p id="empty">Your transcript will appear here.</p></div>
+    <div class="row">
+      <label>Session speaker<select id="speakerSelect"><option value="">No speakers yet</option></select></label>
+      <label>Display name<input id="speakerName" type="text" maxlength="80" placeholder="For example, Maria"></label>
+      <button id="nameSpeaker">Set name</button>
+    </div>
+    <small>Names are your annotations, saved for this session in this browser and included in downloads. Voice matching is probabilistic, not verified identity.</small>
+    <div class="row" role="tablist" aria-label="Transcript views">
+      <button id="liveTab" role="tab" aria-controls="livePanel" aria-selected="true">Live transcript</button>
+      <button id="finalTab" role="tab" aria-controls="finalPanel" aria-selected="false">Final &amp; comparison</button>
+    </div>
+    <div id="livePanel" role="tabpanel" aria-labelledby="liveTab">
+      <article id="draft" class="draft" hidden aria-live="polite"><strong class="speaker" id="draftSpeaker">Speaker pending</strong><p id="draftText"></p><small id="draftInfo">Provisional text — may change</small></article>
+      <div id="liveResults" aria-live="polite"></div>
+    </div>
+    <div id="finalPanel" role="tabpanel" aria-labelledby="finalTab" hidden>
+      <div id="results" aria-live="polite"><p id="empty">Your transcript will appear here.</p></div>
+    </div>
   </section>
   <details><summary>Connection events</summary><pre id="events"></pre></details>
   <script type="module" src="/v2/test/client.js"></script>

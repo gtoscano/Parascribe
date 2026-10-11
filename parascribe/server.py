@@ -468,6 +468,23 @@ async def browser_test_worklet():
                         media_type="text/javascript")
 
 
+@app.get("/v2/test/streaming.js", include_in_schema=False)
+async def browser_test_streaming():
+    return FileResponse(Path(__file__).parent / "web" / "streaming.js",
+                        media_type="text/javascript")
+
+
+def run_preview(item, models):
+    """Ephemeral snapshot decode: no files, session writes, or voice extraction."""
+    import numpy as np
+
+    audio = np.frombuffer(item["pcm"], dtype="<i2").astype(np.float32) / 32768.0
+    transcription, _ = run_sentence_models(
+        audio, mode=item["asr_mode"], language=item["language"],
+        get_parakeet=models.get_sentence_asr, get_cohere=models.get_cohere)
+    return transcription
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -513,6 +530,23 @@ async def _worker(worker_id: int, models: "ModelSet"):
     loop = asyncio.get_running_loop()
     while True:
         job_id = await _queue.get()
+        if isinstance(job_id, dict):
+            # Previews share each worker's model ownership; never run a second
+            # thread against a final decoder or retain draft audio/results.
+            item = job_id
+            future = item["future"]
+            try:
+                if not future.cancelled():
+                    result = await loop.run_in_executor(_executor, run_preview, item, models)
+                    if not future.done():
+                        future.set_result(result)
+            except Exception as error:
+                if not future.done():
+                    future.set_exception(error)
+            finally:
+                item.pop("pcm", None)
+                _queue.task_done()
+            continue
         job = JOBS.get(job_id)
         if not job:
             _queue.task_done()
@@ -867,10 +901,39 @@ async def stream_session(ws: WebSocket, session_id: str):
     started = False
     asr_mode = SESSION_ASR_MODE
     language = None
+    partials = False
+    generation = 0
+    preview_task = None
+    last_preview = 0.0
 
     async def send(message: dict):
         async with send_lock:
             await ws.send_json(message)
+
+    async def preview(pcm, client_id, version):
+        future = asyncio.get_running_loop().create_future()
+        try:
+            await _queue.put({"pcm": pcm, "asr_mode": asr_mode,
+                              "language": language, "future": future})
+            transcription = await future
+            if version == generation:
+                primary = transcription["outputs"][transcription["primary"]]
+                await send({"type": "partial", "client_utterance_id": client_id,
+                            "text": primary["text"], "transcription": transcription,
+                            "speaker_status": "pending", "provisional": True})
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+        except Exception as error:
+            if version == generation:
+                await send({"type": "partial_error", "client_utterance_id": client_id,
+                            "error": str(error)})
+
+    def invalidate_preview():
+        nonlocal generation
+        generation += 1
+        if preview_task and not preview_task.done():
+            preview_task.cancel()
 
     async def process_utterances():
         while True:
@@ -920,10 +983,14 @@ async def stream_session(ws: WebSocket, session_id: str):
                 if not started:
                     await send({"type": "error", "error": "send start before audio"})
                     continue
+                if len(message["bytes"]) % 2:
+                    await send({"type": "error", "error": "PCM16 requires complete samples"})
+                    continue
                 audio.extend(message["bytes"])
                 max_bytes = int(STREAM_MAX_UTTERANCE_SECONDS * sample_rate * 2)
                 if len(audio) > max_bytes:
                     audio.clear()
+                    invalidate_preview()
                     await send({"type": "error", "error": "utterance is too long"})
                 continue
 
@@ -953,14 +1020,33 @@ async def stream_session(ws: WebSocket, session_id: str):
                     await send({"type": "error", "error": "stream already started"})
                     continue
                 asr_mode, language = requested_mode, requested_language
+                partials = command.get("partials") is True
                 started = True
                 audio.clear()
                 await send({"type": "started", "asr_mode": asr_mode, "language": language})
+            elif kind == "preview":
+                # One in-flight preview per connection; discard excess requests
+                # rather than building an ever-growing draft decode backlog.
+                if not started or not partials:
+                    await send({"type": "partial_skipped", "reason": "partials not enabled"})
+                    continue
+                now = time.monotonic()
+                if (len(audio) < 16000 or now - last_preview < 1.0
+                        or (preview_task and not preview_task.done()) or not pending.empty()):
+                    await send({"type": "partial_skipped", "reason": "busy or insufficient audio"})
+                    continue
+                last_preview = now
+                preview_task = asyncio.create_task(preview(
+                    bytes(audio), str(command.get("utterance_id") or "draft"), generation))
+            elif kind == "discard":
+                audio.clear()
+                invalidate_preview()
             elif kind == "commit":
                 if not audio:
                     await send({"type": "error", "error": "no audio to commit"})
                     continue
                 client_id = str(command.get("utterance_id") or uuid.uuid4().hex)
+                invalidate_preview()
                 await pending.put((bytes(audio), client_id, asr_mode, language))
                 audio.clear()
             elif kind == "delete_voiceprints":
@@ -968,6 +1054,7 @@ async def stream_session(ws: WebSocket, session_id: str):
                     SESSION_STORE.delete_voiceprints, session_id)
                 await send({"type": "voiceprints_deleted", "count": deleted})
             elif kind == "end":
+                invalidate_preview()
                 if audio:
                     client_id = str(command.get("utterance_id") or uuid.uuid4().hex)
                     await pending.put((bytes(audio), client_id, asr_mode, language))
@@ -985,6 +1072,12 @@ async def stream_session(ws: WebSocket, session_id: str):
     except WebSocketDisconnect:
         pass
     finally:
+        invalidate_preview()
+        if preview_task:
+            try:
+                await preview_task
+            except asyncio.CancelledError:
+                pass
         processor.cancel()
         try:
             await processor

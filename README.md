@@ -19,6 +19,8 @@ below describes the v1 WhisperX batch pipeline.
 For an interactive v2 test, open `/v2/test` on the running service. The
 [browser tester instructions](README-v2.md#browser-tester) cover uploads,
 microphone streaming, model comparisons, and session voiceprint deletion.
+For gpuccino access, safe ports, and a complete testing checklist, see
+[TO_TEST.md](TO_TEST.md).
 
 It ships with the serving stack, a multi-GPU launcher, a client, a benchmark
 suite, and a short paper (`paper/`) that measures the whole thing.
@@ -83,7 +85,7 @@ cp .env.example .env
 $EDITOR .env          # set HUGGINGFACE_HUB_TOKEN=...
 # Accept the pyannote licenses once (links in .env.example).
 
-# 2a. Build and bring up the checked-in topology (2 replicas + gateway)
+# 2a. Build and bring up the checked-in test topology (1 replica + gateway)
 docker build -t parascribe-api:local ./parascribe
 docker compose -p parascribe-cluster up -d
 

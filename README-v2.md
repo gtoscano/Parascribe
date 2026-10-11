@@ -22,8 +22,12 @@ app is required.
 
 ```bash
 docker build -t parascribe-api:local ./parascribe
-python3 parascribe_cluster.py up --replicas 1
+python3 parascribe_cluster.py up --replicas 1 --gpus 1 --gateway-port 8357 --base-port 18360
 ```
+
+For the complete gpuccino testing procedure, including remote access without
+Tailscale configuration changes, see [TO_TEST.md](TO_TEST.md). Replica ports
+8360/8361 are occupied by other services on this machine; use 18360 here.
 
 1. Create a session with speaker recognition enabled, or paste an existing
    session ID and open it. Session IDs are shown on the page for reconnection.
@@ -45,17 +49,44 @@ The microphone requires HTTPS or a localhost origin. If Parascribe runs on a
 remote machine, use your HTTPS reverse proxy or forward its port:
 
 ```bash
-ssh -L 8357:localhost:8357 your-user@your-server
+ssh -N -L 18357:127.0.0.1:8357 YOUR_USERNAME@gpuccino
 ```
 
-Then open the localhost URL in your own browser. HTTP over a LAN IP can be used
+Replace `YOUR_USERNAME` with your own server account. Each student runs the
+command on their own computer and opens **http://localhost:18357/v2/test** in
+their own browser, leaving the SSH terminal open. HTTP over a LAN IP can be used
 for file uploads, but browsers generally block microphone capture there. Serve
 the tester through Parascribe rather than opening the HTML as `file://`; the
 same-origin API and WebSocket requests avoid CORS configuration.
 
 The tester converts microphone input to mono 16 kHz PCM16 with an AudioWorklet.
-Sentence boundaries are manual; automatic speech/silence detection remains
-future work. Closing the page stops microphone capture and disconnects, but
+Choose **Manual sentences**, **Automatic sentences on pause**, or **Live partial
+text + automatic sentences** in the microphone behavior selector. Automatic
+modes use browser-side energy endpointing with adjustable sensitivity and pause
+length; they ignore idle silence and cap each utterance at 20 seconds. This is
+not neural VAD or overlapping-speaker diarization. Manual mode retains its
+55-second limit and Send sentence works in every mode.
+
+Live mode requests a provisional snapshot decode roughly every 1.5 seconds
+while speaking. These are revisable whole-utterance hypotheses from the selected
+model(s), not native token streaming. They consume additional compute and may
+arrive more slowly under load. Each connection allows only one in-flight
+preview, rate-limits requests, and invalidates stale drafts on finalization.
+Previews reuse background workers but do not create jobs, save audio or
+transcripts, or extract/enroll voiceprints. Finalization performs the normal
+transcription and speaker match once. If four final sentences are pending, the
+browser stops microphone capture so it cannot build an unbounded backlog.
+
+The **Live transcript** tab shows provisional text plus finalized sentences;
+**Final & comparison** shows the detailed retained results and model timings.
+Speaker badges identify the matched session speaker on final sentences. The
+draft explicitly shows **Speaker pending final voice match** rather than
+guessing from the previous speaker. Give a session speaker a display name using
+the controls above the tabs; names are annotations stored only in this browser's
+local storage, scoped to session ID, and included as `speaker_names` in exports.
+They do not establish verified identity or add cross-session voice matching.
+
+Closing the page stops microphone capture and disconnects, but
 does not end the session or delete its signatures: use the explicit controls.
 
 ## Model modes
@@ -86,6 +117,14 @@ WebSocket start example:
 ```json
 {"type":"start","asr_mode":"compare","language":"es","sample_rate":16000,"channels":1}
 ```
+
+For live snapshots, opt in with `"partials": true` on `start`. Send audio,
+then `{"type":"preview","utterance_id":"client-sentence-id"}` without clearing
+the current audio. A `partial` response includes that ID, `provisional: true`,
+`speaker_status: "pending"`, text and per-model outputs. Busy/throttled previews
+receive `partial_skipped`; inference failures receive `partial_error` without
+disabling final transcription. Commit with the same client ID to finalize once.
+`{"type":"discard"}` clears an unfinished segment and invalidates its draft.
 
 Results include `transcription.mode`, `transcription.primary`, and
 `transcription.outputs.parakeet` / `transcription.outputs.cohere`. Each output

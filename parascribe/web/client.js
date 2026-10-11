@@ -1,7 +1,9 @@
+import {SentenceGate} from "/v2/test/streaming.js";
 const $ = id => document.getElementById(id);
 const state = {session: null, ws: null, mic: null, context: null, processor: null,
   pending: new Map(), results: new Map(), flushes: new Map(), samples: 0,
-  busy: false, ending: false, cohere: false};
+  busy: false, ending: false, cohere: false, gate: null, segment: null,
+  delivery: "manual", previewAt: 0, names: {}};
 
 function notice(message, error = false) {
   $("status").textContent = message;
@@ -17,7 +19,7 @@ function update() {
   const locked = state.busy || state.ending;
   const idle = !locked && !streaming && !state.pending.size;
   for (const id of ["create", "attach", "capture", "sessionId"]) $(id).disabled = !idle;
-  for (const id of ["mode", "language", "file"]) $(id).disabled = !idle;
+  for (const id of ["mode", "language", "file", "delivery", "pause", "sensitivity"]) $(id).disabled = !idle;
   $("upload").disabled = !active || !idle || !$("file").files.length;
   $("start").disabled = !active || !idle || !window.isSecureContext || !navigator.mediaDevices;
   $("commit").disabled = !state.mic || locked || state.pending.size >= 4;
@@ -27,6 +29,7 @@ function update() {
   $("refresh").disabled = !state.session || locked;
   $("download").disabled = !state.session || locked;
   $("deleteOnEnd").disabled = !active || locked;
+  $("nameSpeaker").disabled = !state.session || !$("speakerSelect").value;
   $("language").options[0].disabled = $("mode").value !== "parakeet";
   $("activity").textContent = `${state.mic ? "Microphone on" : "Microphone off"} · ${(state.samples / 16000).toFixed(1)}s unsent · ${state.pending.size} pending sentences`;
   $("sessionInfo").textContent = state.session
@@ -62,13 +65,34 @@ function element(tag, text) {
   const node = document.createElement(tag); node.textContent = text; return node;
 }
 
+function speakerLabel(id) {
+  return id ? (state.names[id] ? `${state.names[id]} · ${id}` : id) : "Speaker unidentified / recognition off";
+}
+function speakerControls() {
+  const selected = $("speakerSelect").value;
+  const ids = [...new Set([...state.results.values()].map(result => result.speaker_id).filter(Boolean))];
+  $("speakerSelect").replaceChildren();
+  if (!ids.length) $("speakerSelect").append(new Option("No speakers yet", ""));
+  for (const id of ids) $("speakerSelect").append(new Option(speakerLabel(id), id));
+  if (ids.includes(selected)) $("speakerSelect").value = selected;
+  if (document.activeElement !== $("speakerName")) $("speakerName").value = state.names[$("speakerSelect").value] || "";
+  $("nameSpeaker").disabled = !ids.length;
+}
+function showDraft(text, info = "Provisional text — may change") {
+  $("draft").hidden = false;
+  $("draftSpeaker").textContent = state.session?.capture_voiceprints ? "Speaker pending final voice match" : "Speaker recognition off";
+  $("draftText").textContent = text;
+  $("draftInfo").textContent = info;
+}
+
 function showResult(result, observedMs = null) {
   const previous = state.results.get(result.utterance_id);
   if (previous?.transcription && !result.transcription) return;
   state.results.set(result.utterance_id, result);
   const card = document.createElement("article");
   card.dataset.utterance = result.utterance_id;
-  card.append(element("strong", `Sentence ${result.sequence} · ${result.speaker_id || "No voice signature"}`));
+  const badge = element("strong", speakerLabel(result.speaker_id)); badge.className = "speaker";
+  card.append(badge, element("small", ` · Sentence ${result.sequence}`));
   card.append(element("p", result.text));
   const similarity = result.speaker?.similarity ?? result.speaker_similarity;
   card.append(element("small", `${result.language || "und"} · ${Number(result.audio_seconds).toFixed(1)}s audio${similarity == null ? "" : ` · voice similarity ${similarity.toFixed(3)}`}${observedMs == null ? "" : ` · result in ${(observedMs / 1000).toFixed(2)}s`}`));
@@ -87,14 +111,28 @@ function showResult(result, observedMs = null) {
   }
   const old = Array.from($("results").querySelectorAll("article")).find(node => node.dataset.utterance === result.utterance_id);
   if (old) old.replaceWith(card); else $("results").append(card);
+  const live = document.createElement("article"); live.dataset.utterance = result.utterance_id;
+  live.append(badge.cloneNode(true), element("p", result.text));
+  const existing = [...$("liveResults").children].find(node => node.dataset.utterance === result.utterance_id);
+  if (existing) existing.replaceWith(live); else $("liveResults").append(live);
+  speakerControls();
   $("empty").hidden = true;
 }
 
 async function loadSession(id, reset = false) {
   const session = await api(`/v2/sessions/${encodeURIComponent(id)}`);
-  if (reset) { state.results.clear(); $("results").replaceChildren($("empty")); $("empty").hidden = false; }
+  if (reset) {
+    state.results.clear(); $("results").replaceChildren($("empty")); $("empty").hidden = false;
+    $("liveResults").replaceChildren(); $("draft").hidden = true;
+    try {
+      const names = JSON.parse(localStorage.getItem(`parascribe-names-${id}`) || "{}");
+      state.names = names && typeof names === "object" && !Array.isArray(names) ? names : {};
+    }
+    catch { state.names = {}; }
+  }
   state.session = session; $("sessionId").value = id;
   for (const utterance of session.utterances || []) showResult(utterance);
+  speakerControls();
   update(); return session;
 }
 
@@ -113,10 +151,22 @@ function closeIfIdle() {
 }
 function sendCommit() {
   if (!state.samples || state.ws?.readyState !== WebSocket.OPEN) return;
-  const id = crypto.randomUUID();
+  const id = state.segment || crypto.randomUUID();
   state.pending.set(id, {started: performance.now()});
   state.ws.send(JSON.stringify({type: "commit", utterance_id: id}));
-  state.samples = 0; update();
+  state.samples = 0; state.segment = null; state.gate?.reset();
+  $("draft").hidden = true; update();
+}
+function discardSegment() {
+  if (state.samples && state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({type: "discard"}));
+  state.samples = 0; state.segment = null; state.gate?.reset(); $("draft").hidden = true;
+}
+function captureFrame(buffer) {
+  if (!state.segment) {
+    state.segment = crypto.randomUUID(); state.previewAt = performance.now();
+    if (state.delivery !== "manual") showDraft("Listening…", "Waiting for sentence pause; speaker match pending");
+  }
+  state.ws.send(buffer); state.samples += buffer.byteLength / 2;
 }
 function flush(pause = false) {
   if (!state.processor) return Promise.resolve();
@@ -128,7 +178,9 @@ function flush(pause = false) {
   });
 }
 async function stopMic() {
-  await flush(true); sendCommit(); await disposeAudio(); closeIfIdle();
+  await flush(true);
+  if (state.delivery !== "manual" && state.gate.voiced < 4000) discardSegment(); else sendCommit();
+  await disposeAudio(); closeIfIdle();
   notice("Microphone stopped. Waiting for any submitted sentences to finish.");
 }
 
@@ -143,6 +195,11 @@ function connect(options) {
       const message = JSON.parse(data);
       if (message.type === "ready") ws.send(JSON.stringify({type: "start", format: "pcm_s16le", sample_rate: 16000, channels: 1, ...options}));
       else if (message.type === "started") { started = true; clearTimeout(timer); resolve(); }
+      else if (message.type === "partial" && message.client_utterance_id === state.segment) {
+        if (message.text) showDraft(message.text);
+      } else if (message.type === "partial_error" && message.client_utterance_id === state.segment) {
+        notice(`Live preview failed; final transcription will still be attempted: ${message.error}`, true);
+      }
       else if (message.type === "utterance_queued") {
         const pending = state.pending.get(message.client_utterance_id);
         if (pending) pending.job_id = message.job_id;
@@ -152,7 +209,7 @@ function connect(options) {
         state.pending.delete(message.client_utterance_id);
         if (message.type === "utterance") {
           showResult(message.result, pending ? performance.now() - pending.started : null);
-          notice("Sentence transcribed.");
+          notice(`Sentence transcribed · ${speakerLabel(message.result.speaker_id)}.`);
         } else notice(message.error, true);
         update(); closeIfIdle();
       } else if (message.type === "session_ended") {
@@ -172,12 +229,16 @@ function connect(options) {
       if (state.mic) void disposeAudio().catch(error => notice(error.message, true));
       if (state.pending.size) notice("Connection closed with pending sentences. Refresh the transcript to recover completed results.", true);
       state.pending.clear(); state.samples = 0; state.ending = false; update();
+      state.segment = null; $("draft").hidden = true;
     };
   });
 }
 
 async function startMic() {
   const options = settings();
+  state.delivery = $("delivery").value;
+  state.gate = new SentenceGate({threshold: Number($("sensitivity").value), pause: Number($("pause").value)});
+  options.partials = state.delivery === "live";
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access requires HTTPS or localhost.");
   try {
     state.mic = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true}, video: false});
@@ -190,18 +251,34 @@ async function startMic() {
     state.processor.port.onmessage = ({data}) => {
       if (data.type === "flushed") { state.flushes.get(data.id)?.resolve(); state.flushes.delete(data.id); return; }
       if (data.type !== "audio" || state.ws?.readyState !== WebSocket.OPEN) return;
+      if (state.pending.size >= 4) {
+        discardSegment();
+        notice("Transcription cannot keep up. Microphone stopped; submitted sentences will finish. Restart after they drain.", true);
+        void disposeAudio().then(closeIfIdle); return;
+      }
       if (state.ws.bufferedAmount > 2 * 1024 * 1024) {
         notice("Connection is too slow. Microphone stopped; the current unsent sentence was discarded.", true);
         state.samples = 0; state.ws.close(); void disposeAudio(); return;
       }
-      state.ws.send(data.buffer); state.samples += data.buffer.byteLength / 2;
-      if (state.samples >= 55 * 16000) sendCommit();
+      if (state.delivery === "manual") {
+        captureFrame(data.buffer);
+        if (state.samples >= 55 * 16000) sendCommit();
+      } else {
+        const {frames, boundary} = state.gate.push(data.buffer);
+        for (const frame of frames) captureFrame(frame);
+        if (boundary === "commit") sendCommit();
+        else if (boundary === "discard") discardSegment();
+        else if (state.delivery === "live" && state.samples >= 8000 && performance.now() - state.previewAt >= 1500 && !state.pending.size) {
+          state.ws.send(JSON.stringify({type: "preview", utterance_id: state.segment}));
+          state.previewAt = performance.now();
+        }
+      }
       update();
     };
     const source = state.context.createMediaStreamSource(state.mic);
     const silent = state.context.createGain(); silent.gain.value = 0;
     source.connect(state.processor); state.processor.connect(silent); silent.connect(state.context.destination);
-    notice("Microphone on. Speak, then click Send sentence.");
+    notice(`Microphone on. ${state.delivery === "manual" ? "Speak, then click Send sentence." : "Speak naturally; pauses submit sentences automatically."}`);
   } catch (error) {
     await disposeAudio(); state.ws?.close(); throw error;
   }
@@ -217,6 +294,21 @@ $("attach").onclick = () => run(async () => {
 });
 $("mode").onchange = () => { if ($("mode").value !== "parakeet" && !$("language").value) $("language").value = "en"; update(); };
 $("file").onchange = update;
+$("speakerSelect").onchange = () => { $("speakerName").value = state.names[$("speakerSelect").value] || ""; update(); };
+$("nameSpeaker").onclick = () => {
+  const id = $("speakerSelect").value; if (!id) return;
+  const name = $("speakerName").value.trim();
+  if (name) state.names[id] = name; else delete state.names[id];
+  try { localStorage.setItem(`parascribe-names-${state.session.session_id}`, JSON.stringify(state.names)); }
+  catch { notice("Name applied, but browser storage is unavailable.", true); }
+  for (const result of [...state.results.values()]) showResult(result);
+};
+for (const tab of ["live", "final"]) $(`${tab}Tab`).onclick = () => {
+  for (const name of ["live", "final"]) {
+    $(`${name}Tab`).setAttribute("aria-selected", String(name === tab));
+    $(`${name}Panel`).hidden = name !== tab;
+  }
+};
 $("start").onclick = () => run(startMic);
 $("commit").onclick = () => run(async () => { await flush(); sendCommit(); });
 $("stop").onclick = () => run(stopMic);
@@ -231,7 +323,11 @@ $("end").onclick = () => run(async () => {
   if (state.ws?.readyState === WebSocket.OPEN) {
     state.ending = true;
     try {
-      if (state.mic) { await flush(true); sendCommit(); await disposeAudio(); }
+      if (state.mic) {
+        await flush(true);
+        if (state.delivery !== "manual" && state.gate.voiced < 4000) discardSegment(); else sendCommit();
+        await disposeAudio();
+      }
       state.ws.send(JSON.stringify({type: "end", delete_voiceprints: deleteVoiceprints}));
       notice("Finishing pending sentences and ending the session…");
     } catch (error) { state.ending = false; throw error; }
@@ -259,7 +355,7 @@ $("upload").onclick = () => run(async () => {
 });
 $("download").onclick = () => run(async () => {
   await loadSession(state.session.session_id);
-  const blob = new Blob([JSON.stringify({session: state.session, results: [...state.results.values()]}, null, 2)], {type: "application/json"});
+  const blob = new Blob([JSON.stringify({session: state.session, speaker_names: state.names, results: [...state.results.values()]}, null, 2)], {type: "application/json"});
   const url = URL.createObjectURL(blob), link = document.createElement("a");
   link.href = url; link.download = `parascribe-${state.session.session_id}.json`; link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
