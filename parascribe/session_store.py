@@ -118,6 +118,19 @@ class SessionStore:
                     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
                 );
 
+                -- Unmatched voices wait here until a second utterance confirms
+                -- them, so one stray clip cannot create a speaker.  These are
+                -- voiceprints too and are deleted with the voiceprints table.
+                CREATE TABLE IF NOT EXISTS pending_voiceprints (
+                    utterance_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    speech_seconds REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS utterances (
                     utterance_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -234,14 +247,32 @@ class SessionStore:
         audio_seconds: float,
         similarity_threshold: float,
         update_threshold: float,
-    ) -> tuple[str | None, float | None, bool]:
+        utterance_id: str | None = None,
+        confirm_new_speakers: bool = False,
+        pending_limit: int = 20,
+    ) -> dict:
         """Match or enroll one speaker inside ``session_id``.
 
-        Returns ``(speaker_id, similarity, enrolled)``.  Marginal matches are
-        identified but do not update the centroid, which limits drift.
+        Matches at or above ``update_threshold`` refine the speaker centroid,
+        weighted by speech duration.  Without confirmation, an unmatched voice
+        enrolls a new speaker immediately.  With ``confirm_new_speakers`` it is
+        held as pending (``speaker_id`` None) until a later unmatched utterance
+        agrees with it; both utterances are then labelled with the new speaker
+        and the earlier one is reported in ``relabeled``.  ``utterance_id``
+        names an already stored utterance whose speaker fields are updated.
         """
         vector = self._normalise(embedding)
         now = _now()
+        result = {"speaker_id": None, "similarity": None, "enrolled": False,
+                  "pending": False, "relabeled": []}
+
+        def label(connection, target: str, speaker_id: str, similarity: float | None):
+            connection.execute(
+                """UPDATE utterances SET speaker_id = ?, speaker_similarity = ?
+                   WHERE utterance_id = ? AND session_id = ?""",
+                (speaker_id, similarity, target, session_id),
+            )
+
         with self._transaction(immediate=True) as connection:
             session = connection.execute(
                 "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
@@ -251,7 +282,9 @@ class SessionStore:
             if session["status"] != "active":
                 raise SessionEnded(session_id)
             if not session["capture_voiceprints"]:
-                return None, None, False
+                return result
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?", (now, session_id))
 
             rows = list(
                 connection.execute(
@@ -267,26 +300,61 @@ class SessionStore:
                 similarity = similarities[best_index]
                 if similarity >= similarity_threshold:
                     if similarity >= update_threshold:
-                        samples = int(best["sample_count"])
+                        seconds = float(best["speech_seconds"])
                         centroid = self._normalise(
-                            (self._decode(best) * samples + vector) / (samples + 1)
-                        )
+                            self._decode(best) * seconds + vector * audio_seconds)
                         connection.execute(
                             """UPDATE voiceprints
                                SET embedding = ?, sample_count = ?, speech_seconds = ?,
                                    updated_at = ?
                                WHERE session_id = ? AND speaker_id = ?""",
                             (
-                                centroid.tobytes(), samples + 1,
-                                float(best["speech_seconds"]) + audio_seconds,
-                                now, session_id, best["speaker_id"],
+                                centroid.tobytes(), int(best["sample_count"]) + 1,
+                                seconds + audio_seconds, now, session_id, best["speaker_id"],
                             ),
                         )
+                    if utterance_id:
+                        label(connection, utterance_id, best["speaker_id"], similarity)
+                    result.update(speaker_id=best["speaker_id"], similarity=similarity)
+                    return result
+
+            centroid, samples, seconds, partner = vector, 1, audio_seconds, None
+            if confirm_new_speakers:
+                pending = [
+                    row for row in connection.execute(
+                        """SELECT * FROM pending_voiceprints WHERE session_id = ?
+                           ORDER BY created_at""", (session_id,))
+                    if row["dimensions"] == vector.size and row["utterance_id"] != utterance_id
+                ]
+                scores = [float(np.dot(vector, self._decode(row))) for row in pending]
+                if not scores or max(scores) < similarity_threshold:
                     connection.execute(
-                        "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
-                        (now, session_id),
+                        """INSERT OR REPLACE INTO pending_voiceprints(
+                               utterance_id, session_id, embedding, dimensions,
+                               speech_seconds, created_at
+                           ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        (utterance_id or uuid.uuid4().hex, session_id, vector.tobytes(),
+                         vector.size, audio_seconds, now),
                     )
-                    return best["speaker_id"], similarity, False
+                    connection.execute(
+                        """DELETE FROM pending_voiceprints WHERE session_id = ?
+                           AND utterance_id NOT IN (
+                               SELECT utterance_id FROM pending_voiceprints
+                               WHERE session_id = ? ORDER BY created_at DESC LIMIT ?)""",
+                        (session_id, session_id, max(1, pending_limit)),
+                    )
+                    result["pending"] = True
+                    return result
+                partner = pending[int(np.argmax(scores))]
+                result["similarity"] = max(scores)
+                partner_seconds = float(partner["speech_seconds"])
+                centroid = self._normalise(
+                    self._decode(partner) * partner_seconds + vector * audio_seconds)
+                samples, seconds = 2, partner_seconds + audio_seconds
+                connection.execute(
+                    "DELETE FROM pending_voiceprints WHERE utterance_id = ?",
+                    (partner["utterance_id"],),
+                )
 
             next_number = 1 + max(
                 (int(row["speaker_id"].split("_")[-1]) for row in rows), default=0
@@ -296,17 +364,28 @@ class SessionStore:
                 """INSERT INTO voiceprints(
                        session_id, speaker_id, embedding, dimensions, sample_count,
                        speech_seconds, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    session_id, speaker_id, vector.tobytes(), vector.size,
-                    audio_seconds, now, now,
+                    session_id, speaker_id, centroid.tobytes(), centroid.size,
+                    samples, seconds, now, now,
                 ),
             )
-            connection.execute(
-                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
-                (now, session_id),
-            )
-            return speaker_id, None, True
+            if utterance_id:
+                label(connection, utterance_id, speaker_id, result["similarity"])
+            if partner is not None:
+                label(connection, partner["utterance_id"], speaker_id, result["similarity"])
+                row = connection.execute(
+                    "SELECT sequence FROM utterances WHERE utterance_id = ?",
+                    (partner["utterance_id"],),
+                ).fetchone()
+                result["relabeled"].append({
+                    "utterance_id": partner["utterance_id"],
+                    "sequence": row["sequence"] if row else None,
+                    "speaker_id": speaker_id,
+                    "speaker_similarity": result["similarity"],
+                })
+            result.update(speaker_id=speaker_id, enrolled=True)
+            return result
 
     def append_utterance(
         self,
@@ -318,9 +397,10 @@ class SessionStore:
         speaker_similarity: float | None,
         audio_seconds: float,
         source: str,
+        utterance_id: str | None = None,
     ) -> dict:
         now = _now()
-        utterance_id = uuid.uuid4().hex
+        utterance_id = utterance_id or uuid.uuid4().hex
         with self._transaction(immediate=True) as connection:
             session = connection.execute(
                 "SELECT status FROM sessions WHERE session_id = ?", (session_id,)
@@ -371,6 +451,8 @@ class SessionStore:
                 "DELETE FROM voiceprints WHERE session_id = ?", (session_id,)
             ).rowcount
             connection.execute(
+                "DELETE FROM pending_voiceprints WHERE session_id = ?", (session_id,))
+            connection.execute(
                 """UPDATE sessions
                    SET capture_voiceprints = 0, signatures_deleted_at = ?, updated_at = ?
                    WHERE session_id = ?""",
@@ -396,6 +478,8 @@ class SessionStore:
             if delete_voiceprints:
                 connection.execute(
                     "DELETE FROM voiceprints WHERE session_id = ?", (session_id,))
+                connection.execute(
+                    "DELETE FROM pending_voiceprints WHERE session_id = ?", (session_id,))
                 connection.execute(
                     """UPDATE sessions
                        SET capture_voiceprints = 0, signatures_deleted_at = ?, updated_at = ?

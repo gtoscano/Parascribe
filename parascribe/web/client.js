@@ -66,7 +66,9 @@ function element(tag, text) {
 }
 
 function speakerLabel(id) {
-  return id ? (state.names[id] ? `${state.names[id]} · ${id}` : id) : "Speaker unidentified / recognition off";
+  if (id) return state.names[id] ? `${state.names[id]} · ${id}` : id;
+  // Unmatched voices are held until a second sentence confirms a new speaker.
+  return state.session?.capture_voiceprints ? "Speaker pending confirmation" : "Speaker unidentified / recognition off";
 }
 function speakerControls() {
   const selected = $("speakerSelect").value;
@@ -117,6 +119,10 @@ function showResult(result, observedMs = null) {
   if (existing) existing.replaceWith(live); else $("liveResults").append(live);
   speakerControls();
   $("empty").hidden = true;
+  for (const item of result.speaker?.relabeled || []) {
+    const earlier = state.results.get(item.utterance_id);
+    if (earlier) showResult({...earlier, speaker_id: item.speaker_id, speaker_similarity: item.speaker_similarity, speaker: undefined});
+  }
 }
 
 async function loadSession(id, reset = false) {

@@ -85,10 +85,15 @@ SESSION_ASR_THREADS = int(os.environ.get(
 SESSION_ASR_MIN_CONFIDENCE = float(
     os.environ.get("SESSION_ASR_MIN_CONFIDENCE", "0"))
 VOICEPRINT_MODEL = os.environ.get("VOICEPRINT_MODEL", DEFAULT_VOICEPRINT_MODEL)
+# Defaults calibrated on AMI meeting utterances (see README-v2.md): short
+# same-speaker clips often score 0.3-0.6, other speakers rarely exceed 0.35.
 VOICEPRINT_SIMILARITY_THRESHOLD = float(
-    os.environ.get("VOICEPRINT_SIMILARITY_THRESHOLD", "0.50"))
+    os.environ.get("VOICEPRINT_SIMILARITY_THRESHOLD", "0.30"))
 VOICEPRINT_UPDATE_THRESHOLD = float(
-    os.environ.get("VOICEPRINT_UPDATE_THRESHOLD", "0.70"))
+    os.environ.get("VOICEPRINT_UPDATE_THRESHOLD", "0.30"))
+VOICEPRINT_CONFIRM_NEW_SPEAKERS = os.environ.get(
+    "VOICEPRINT_CONFIRM_NEW_SPEAKERS", "1").lower() not in ("0", "false", "no")
+VOICEPRINT_PENDING_LIMIT = int(os.environ.get("VOICEPRINT_PENDING_LIMIT", "20"))
 STREAM_MAX_UTTERANCE_SECONDS = float(
     os.environ.get("STREAM_MAX_UTTERANCE_SECONDS", "60"))
 SENTENCE_MAX_UPLOAD_BYTES = int(
@@ -393,9 +398,7 @@ def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
         raise ValueError("no speech was transcribed from this utterance")
 
     session = SESSION_STORE.get_session(job["session_id"])
-    speaker_id = None
-    similarity = None
-    enrolled = False
+    embedding = None
     if session["capture_voiceprints"]:
         job["stage"] = "voiceprint"
         extractor = _timed(
@@ -403,11 +406,27 @@ def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
         embedding = _timed(
             job, "extract_voiceprint_s", extractor, audio_path,
             audio_seconds=audio_seconds)
-        speaker_id, similarity, enrolled = _timed(
+
+    # Store first so a later confirmation can relabel this utterance.
+    job["stage"] = "store_utterance"
+    utterance = _timed(
+        job, "store_utterance_s", SESSION_STORE.append_utterance,
+        job["session_id"], text=text, language=lang, speaker_id=None,
+        speaker_similarity=None, audio_seconds=audio_seconds,
+        source=job.get("source", "sentence"),
+    )
+    match = {"speaker_id": None, "similarity": None, "enrolled": False,
+             "pending": False, "relabeled": []}
+    if embedding is not None:
+        job["stage"] = "match_voiceprint"
+        match = _timed(
             job, "match_voiceprint_s", SESSION_STORE.match_voiceprint,
             job["session_id"], embedding, audio_seconds=audio_seconds,
             similarity_threshold=VOICEPRINT_SIMILARITY_THRESHOLD,
             update_threshold=VOICEPRINT_UPDATE_THRESHOLD,
+            utterance_id=utterance["utterance_id"],
+            confirm_new_speakers=VOICEPRINT_CONFIRM_NEW_SPEAKERS,
+            pending_limit=VOICEPRINT_PENDING_LIMIT,
         )
     else:
         job["timings"].update({
@@ -415,22 +434,18 @@ def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
             "extract_voiceprint_s": 0.0,
             "match_voiceprint_s": 0.0,
         })
-
-    job["stage"] = "store_utterance"
-    utterance = _timed(
-        job, "store_utterance_s", SESSION_STORE.append_utterance,
-        job["session_id"], text=text, language=lang, speaker_id=speaker_id,
-        speaker_similarity=similarity, audio_seconds=audio_seconds,
-        source=job.get("source", "sentence"),
-    )
+    utterance.update(speaker_id=match["speaker_id"],
+                     speaker_similarity=match["similarity"])
     job["result"] = {
         **utterance,
         "transcription": transcription,
         "speaker": {
-            "id": speaker_id,
-            "similarity": similarity,
-            "enrolled": enrolled,
-            "signature_stored": speaker_id is not None,
+            "id": match["speaker_id"],
+            "similarity": match["similarity"],
+            "enrolled": match["enrolled"],
+            "pending": match["pending"],
+            "relabeled": match["relabeled"],
+            "signature_stored": match["speaker_id"] is not None or match["pending"],
         },
     }
     job["timings"]["pipeline_s"] = round(

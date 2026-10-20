@@ -51,11 +51,13 @@ services:
       - SESSION_ASR_MODE=${SESSION_ASR_MODE:-parakeet}
       - COHERE_MODEL_PATH=/models/cohere-transcribe-03-2026-Q8_0.gguf
       - COHERE_BACKEND=${COHERE_BACKEND:-cpu}
-      # V2 speaker embeddings are compared only inside one session. These
-      # thresholds must be calibrated against representative recordings.
+      # V2 speaker embeddings are compared only inside one session. Defaults
+      # were calibrated on AMI meeting utterances; recalibrate per deployment.
+      # New speakers are created only after two unmatched sentences agree.
       - VOICEPRINT_MODEL=pyannote/wespeaker-voxceleb-resnet34-LM
-      - VOICEPRINT_SIMILARITY_THRESHOLD=0.50
-      - VOICEPRINT_UPDATE_THRESHOLD=0.70
+      - VOICEPRINT_SIMILARITY_THRESHOLD=0.30
+      - VOICEPRINT_UPDATE_THRESHOLD=0.30
+      - VOICEPRINT_CONFIRM_NEW_SPEAKERS=1
       - STREAM_MAX_UTTERANCE_SECONDS=60
       # One worker per replica: parallelism comes from multiple replica
       # processes, not threads. REPLICA_ID is stamped onto job_ids so the

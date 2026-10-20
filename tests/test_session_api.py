@@ -161,6 +161,40 @@ class SessionApiTest(unittest.TestCase):
                 socket.send_json({"type": "end"})
                 socket.receive_json()
 
+    def test_new_speaker_is_confirmed_and_earlier_utterance_relabeled(self):
+        import numpy as np
+        from test_sentence_asr import FakeTranscriber
+
+        voices = iter([np.array([1.0, 0.0]), np.array([0.95, 0.05])])
+        with patch.object(server.ModelSet, "get_sentence_asr", return_value=FakeTranscriber("test", "Hi")), \
+                patch.object(server.ModelSet, "get_voiceprint", return_value=lambda *a, **k: next(voices)), \
+                patch.object(server, "_load_audio_16k", return_value=np.zeros(32000)), \
+                patch.object(server, "VOICEPRINT_CONFIRM_NEW_SPEAKERS", True), \
+                TestClient(server.app) as client:
+            session_id = client.post(
+                "/v2/sessions", json={"capture_voiceprints": True}).json()["session_id"]
+            with client.websocket_connect(f"/v2/sessions/{session_id}/stream") as socket:
+                socket.receive_json()
+                socket.send_json({"type": "start"})
+                socket.receive_json()
+                results = []
+                for name in ("first", "second"):
+                    socket.send_bytes(b"\0\0" * 32000)
+                    socket.send_json({"type": "commit", "utterance_id": name})
+                    self.assertEqual(socket.receive_json()["type"], "utterance_queued")
+                    results.append(socket.receive_json()["result"])
+                socket.send_json({"type": "end", "delete_voiceprints": True})
+                socket.receive_json()
+
+            first, second = results
+            self.assertIsNone(first["speaker_id"])
+            self.assertTrue(first["speaker"]["pending"])
+            self.assertEqual(second["speaker_id"], "speaker_1")
+            self.assertEqual(second["speaker"]["relabeled"][0]["utterance_id"],
+                             first["utterance_id"])
+            stored = client.get(f"/v2/sessions/{session_id}").json()["utterances"]
+            self.assertEqual([u["speaker_id"] for u in stored], ["speaker_1", "speaker_1"])
+
     def test_session_lifecycle_and_voiceprint_deletion(self):
         with TestClient(server.app) as client:
             created = client.post(

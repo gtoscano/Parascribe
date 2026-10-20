@@ -174,7 +174,42 @@ There is intentionally no global speaker directory. Two sessions can each
 contain `speaker_1`, but Parascribe never compares those voiceprints. A sentence
 upload must contain one speaker; use `/v1/transcribe` for a multi-speaker file.
 
-The default similarity thresholds are starting points, not universal identity
+### New-speaker confirmation
+
+A sentence whose voice matches no session speaker does not create a speaker
+immediately. Its voiceprint is held as *pending* and the sentence is returned
+with `speaker.id: null` and `speaker.pending: true` (the tester shows **Speaker
+pending confirmation**). When a later unmatched sentence agrees with a pending
+voice, Parascribe enrolls a new speaker from both, labels the new sentence, and
+relabels the earlier one. The earlier sentence is listed in
+`speaker.relabeled` and the stored transcript is updated. A voice heard only
+once stays unlabelled. At most `VOICEPRINT_PENDING_LIMIT` pending voices are
+kept per session; set `VOICEPRINT_CONFIRM_NEW_SPEAKERS=0` to enroll on the
+first sentence instead.
+
+Every match at or above `VOICEPRINT_UPDATE_THRESHOLD` refines the speaker's
+centroid, weighted by speech duration, so speakers become easier to recognize as
+the session continues.
+
+### Calibration
+
+The defaults come from an offline replay of 883 single-speaker utterances
+(0.5–20 s, ground-truth AMI `only_words` RTTMs) from twelve four-speaker AMI
+meetings, embedded with the production WeSpeaker model. Within a meeting,
+different speakers almost never exceed cosine 0.35 (99th percentile 0.34–0.37),
+while same-speaker scores depend strongly on duration (median 0.39 at
+0.5–1.5 s, 0.56 at 1.5–3 s, 0.72 at 3–6 s). Replaying each meeting in order:
+
+| Policy | Speakers per 4-speaker meeting | Correctly labelled | Unlabelled |
+|---|---:|---:|---:|
+| Former defaults (match 0.50, update 0.70) | 21.2 | 64% | 0% |
+| Match/update 0.30, enroll immediately | 6.2 | 89% | 0% |
+| Match/update 0.30, confirm new speakers | 3.8 | 87% | 8% |
+
+“Correctly labelled” maps each true speaker to their largest predicted speaker.
+Close-talk or noisy microphones can shift these scores.
+
+These thresholds are starting points, not universal identity
 guarantees. Calibrate them with representative microphones, rooms, languages,
 and speakers before using the result for anything consequential. Do not use
 voiceprints as authentication.
@@ -185,8 +220,9 @@ Session transcripts and voiceprints are stored in `/data/sessions.sqlite3`, a
 volume shared by the replicas. Uploaded v2 audio is deleted after processing;
 the transcript, anonymous speaker id, job result, and timings remain.
 
-Voiceprints are biometric data. They are held in a separate table so the client
-can delete the vectors while retaining the transcript:
+Voiceprints are biometric data. Speaker centroids and pending (unconfirmed)
+voices are held in separate tables so the client can delete the vectors while
+retaining the transcript; deletion removes both:
 
 ```http
 DELETE /v2/sessions/{session_id}/voiceprints
@@ -233,12 +269,19 @@ The completed result contains the transcript and session-local identity:
     "id": "speaker_1",
     "similarity": 0.83,
     "enrolled": false,
+    "pending": false,
+    "relabeled": [],
     "signature_stored": true
   }
 }
 ```
 
-On a speaker's first utterance, `enrolled` is `true` and `similarity` is `null`.
+When a sentence's voice is not yet confirmed, `id` is `null` and `pending` is
+`true`. When a second sentence confirms a new speaker, `enrolled` is `true`,
+`similarity` is its score against the pending voice, and `relabeled` lists the
+earlier sentence that now carries the same id. With
+`VOICEPRINT_CONFIRM_NEW_SPEAKERS=0`, the first utterance enrolls immediately and
+`similarity` is `null`.
 If voiceprint capture was disabled or deleted, `id` is `null` while
 transcription continues normally.
 
@@ -295,12 +338,14 @@ to every replica.
 | `SESSION_ASR_THREADS` | half the CPUs | Parakeet ONNX intra-op / Cohere session threads |
 | `SESSION_ASR_MIN_CONFIDENCE` | `0` | Optional mean token-confidence floor |
 | `VOICEPRINT_MODEL` | `pyannote/wespeaker-voxceleb-resnet34-LM` | Speaker embedding model |
-| `VOICEPRINT_SIMILARITY_THRESHOLD` | `0.50` | Minimum cosine similarity for a match |
-| `VOICEPRINT_UPDATE_THRESHOLD` | `0.70` | Minimum similarity before updating a speaker centroid |
+| `VOICEPRINT_SIMILARITY_THRESHOLD` | `0.30` | Minimum cosine similarity for a match or new-speaker confirmation |
+| `VOICEPRINT_UPDATE_THRESHOLD` | `0.30` | Minimum similarity before updating a speaker centroid |
+| `VOICEPRINT_CONFIRM_NEW_SPEAKERS` | `1` | Require a second agreeing sentence before enrolling a new speaker |
+| `VOICEPRINT_PENDING_LIMIT` | `20` | Unconfirmed voices kept per session |
 | `STREAM_MAX_UTTERANCE_SECONDS` | `60` | WebSocket commit size limit |
 | `SENTENCE_MAX_UPLOAD_BYTES` | `33554432` | REST sentence upload limit |
 
-The centroid is updated only on confident matches to reduce identity drift.
 The current implementation does not resolve overlapping speakers inside one
-sentence, merge accidentally split identities, authenticate clients, or encrypt
+sentence (a long chunk containing two voices yields a blended voiceprint),
+merge accidentally split identities, authenticate clients, or encrypt
 the database at rest. Those are the next production-hardening items.
