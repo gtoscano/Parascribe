@@ -312,6 +312,10 @@ Protocol:
 3. Client sends binary mono PCM16 audio frames.
 4. Client sends `{"type":"commit","utterance_id":"client-1"}` at a sentence or VAD boundary.
 5. Server sends `utterance_queued`, then `utterance` with the final result.
+   If the primary engine recognizes no speech, it sends `no_speech` instead
+   (with both engine outputs in `result.transcription`); no transcript entry or
+   voiceprint is stored and the stream stays open. REST sentence jobs finish as
+   `done` with `result.no_speech: true`.
 6. Repeat steps 3–5 while prior utterances are processed; up to eight committed
    utterances may be buffered per connection.
 7. Client sends `{"type":"end","delete_voiceprints":true}` and receives

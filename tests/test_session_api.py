@@ -161,6 +161,37 @@ class SessionApiTest(unittest.TestCase):
                 socket.send_json({"type": "end"})
                 socket.receive_json()
 
+    def test_no_speech_is_reported_without_storing_and_stream_continues(self):
+        import numpy as np
+        from unittest.mock import MagicMock
+        from test_sentence_asr import FakeTranscriber
+
+        voiceprint = MagicMock()
+        with patch.object(server.ModelSet, "get_sentence_asr", return_value=FakeTranscriber("test", "")), \
+                patch.object(server.ModelSet, "get_voiceprint", voiceprint), \
+                patch.object(server, "_load_audio_16k", return_value=np.zeros(16000)), \
+                TestClient(server.app) as client:
+            session_id = client.post(
+                "/v2/sessions", json={"capture_voiceprints": True}).json()["session_id"]
+            with client.websocket_connect(f"/v2/sessions/{session_id}/stream") as socket:
+                socket.receive_json()
+                socket.send_json({"type": "start"})
+                socket.receive_json()
+                for name in ("silent-1", "silent-2"):
+                    socket.send_bytes(b"\0\0" * 16000)
+                    socket.send_json({"type": "commit", "utterance_id": name})
+                    queued = socket.receive_json()
+                    completed = socket.receive_json()
+                    self.assertEqual(completed["type"], "no_speech")
+                    self.assertEqual(completed["client_utterance_id"], name)
+                    self.assertTrue(completed["result"]["no_speech"])
+                    self.assertEqual(server.JOBS[queued["job_id"]]["status"], "done")
+                socket.send_json({"type": "end"})
+                socket.receive_json()
+
+            voiceprint.assert_not_called()
+            self.assertEqual(client.get(f"/v2/sessions/{session_id}").json()["utterances"], [])
+
     def test_new_speaker_is_confirmed_and_earlier_utterance_relabeled(self):
         import numpy as np
         from test_sentence_asr import FakeTranscriber

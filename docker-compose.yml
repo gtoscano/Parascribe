@@ -3,6 +3,7 @@
 # gateway -> :8357 (clients)   replicas -> :18360..18360 (direct)
 # Regenerate:  python3 parascribe_cluster.py gen
 # Build the image first:  docker build -t parascribe-api:local ./parascribe
+name: parascribe-cluster
 networks:
   parascribe-net:
     driver: bridge

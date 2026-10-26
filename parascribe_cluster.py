@@ -277,6 +277,8 @@ def generate_compose(per_gpu: int, base_port: int, gateway_port: int,
         f":{base_port}..{base_port + total - 1} (direct)\n"
         "# Regenerate:  python3 parascribe_cluster.py gen\n"
         f"# Build the image first:  docker build -t {IMAGE} {BUILD_CONTEXT}\n"
+        # Lets a plain `docker compose down` here find the launcher's project.
+        f"name: {PROJECT}\n"
         "networks:\n"
         f"  {NETWORK}:\n"
         "    driver: bridge\n"

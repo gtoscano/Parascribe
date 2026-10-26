@@ -395,7 +395,22 @@ def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
     primary = transcription["outputs"][transcription["primary"]]
     text, lang = primary["text"], primary["language"]
     if not text:
-        raise ValueError("no speech was transcribed from this utterance")
+        # Silence or unrecognized audio is a normal outcome, not a failure:
+        # store no transcript entry or voiceprint and let the client continue.
+        job["result"] = {
+            "no_speech": True,
+            "session_id": job["session_id"],
+            "utterance_id": None,
+            "text": "",
+            "language": lang,
+            "audio_seconds": audio_seconds,
+            "source": job.get("source", "sentence"),
+            "transcription": transcription,
+            "speaker": None,
+        }
+        job["timings"]["pipeline_s"] = round(
+            time.perf_counter() - pipeline_started, 6)
+        return
 
     session = SESSION_STORE.get_session(job["session_id"])
     embedding = None
@@ -974,7 +989,8 @@ async def stream_session(ws: WebSocket, session_id: str):
                 await send({"type": "utterance_queued", "job_id": job["job_id"],
                             "client_utterance_id": client_utterance_id})
                 result = await future
-                await send({"type": "utterance", "job_id": job["job_id"],
+                await send({"type": "no_speech" if result.get("no_speech") else "utterance",
+                            "job_id": job["job_id"],
                             "client_utterance_id": client_utterance_id,
                             "result": result})
             except Exception as error:  # keep the stream alive for the next sentence

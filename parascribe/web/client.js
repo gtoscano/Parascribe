@@ -210,10 +210,11 @@ function connect(options) {
         const pending = state.pending.get(message.client_utterance_id);
         if (pending) pending.job_id = message.job_id;
         notice(`Processing sentence · job ${message.job_id}`);
-      } else if (message.type === "utterance" || message.type === "utterance_error") {
+      } else if (message.type === "utterance" || message.type === "utterance_error" || message.type === "no_speech") {
         const pending = state.pending.get(message.client_utterance_id);
         state.pending.delete(message.client_utterance_id);
-        if (message.type === "utterance") {
+        if (message.type === "no_speech") notice("No speech recognized in that segment; still listening.");
+        else if (message.type === "utterance") {
           showResult(message.result, pending ? performance.now() - pending.started : null);
           notice(`Sentence transcribed · ${speakerLabel(message.result.speaker_id)}.`);
         } else notice(message.error, true);
@@ -352,6 +353,7 @@ $("upload").onclick = () => run(async () => {
   const deadline = Date.now() + 10 * 60 * 1000;
   while (Date.now() < deadline) {
     const job = await api(`/v1/jobs/${encodeURIComponent(queued.job_id)}`);
+    if (job.status === "done" && job.result.no_speech) { notice("No speech recognized in the uploaded audio."); return; }
     if (job.status === "done") { showResult(job.result, performance.now() - started); notice("Uploaded sentence transcribed."); return; }
     if (job.status === "error") throw new Error(job.error || "Transcription failed.");
     notice(`Job ${queued.job_id}: ${job.stage || job.status}`);
