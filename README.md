@@ -85,26 +85,69 @@ cp .env.example .env
 $EDITOR .env          # set HUGGINGFACE_HUB_TOKEN=...
 # Accept the pyannote licenses once (links in .env.example).
 
-# 2a. Build and bring up the checked-in test topology (1 replica + gateway)
-docker build -t parascribe-api:local ./parascribe
-docker compose -p parascribe-cluster up -d
-
-# 1b. Pre-download the model weights (optional but recommended).
-#     Only the libraries are baked into the image; weights are pulled on first
-#     use, so without this the first request stalls for minutes and a gated
-#     pyannote repo fails outright if its licence was never accepted.
+# 2. Pre-download the model weights (optional but recommended).
+#    Only the libraries are baked into the image; weights are pulled on first
+#    use, so without this the first request stalls for minutes and a gated
+#    pyannote repo fails outright if its licence was never accepted.
 python3 fetch_models.py           # fetches whatever is missing, skips the rest
 python3 fetch_models.py --check   # report only; exit 1 if anything is absent
+python3 fetch_cohere.py           # v2 Cohere weights into models/ (cohere/compare modes)
 
-# 2b. Or generate a topology for this machine's GPUs (recommended).
-#     Note: `up`/`gen` rewrite docker-compose.yml and parascribe-nginx.conf.
+# 3. Build the image
+docker build -t parascribe-api:local ./parascribe
+
+# 4a. Bring up the checked-in topology (1 replica + gateway)
+docker compose up -d
+
+# 4b. Or generate a topology for this machine's GPUs (recommended).
+#     `up` builds the image itself; `up`/`gen` rewrite docker-compose.yml and
+#     parascribe-nginx.conf.
 REPLICAS=3 python3 parascribe_cluster.py up            # 3 replicas on one GPU
 python3 parascribe_cluster.py up --replicas 3 --gpus 0,1,2,3   # 12 replicas, 4 GPUs
 python3 parascribe_cluster.py up --replicas 3 --gpus 0,1 --dry-run   # preview + GPU check
 ```
 
-The gateway listens on **`:8357`** (single endpoint, load-balanced). Manage the
-cluster with `parascribe_cluster.py {ps,down,urls}`.
+The gateway listens on **`:8357`** (single endpoint, load-balanced). The
+generated `docker-compose.yml` names its project `parascribe-cluster`, so
+plain `docker compose up -d` / `docker compose down` / `docker compose ps` in
+the repository root manage the same deployment as
+`parascribe_cluster.py {up,down,ps,urls}`.
+
+`docker compose up -d` reuses the existing `parascribe-api:local` image (the
+compose file has no `build:` section). After pulling or editing code, rebuild
+first with `docker build -t parascribe-api:local ./parascribe`, or use
+`parascribe_cluster.py up`.
+
+### Running from scratch
+
+A fresh clone contains only code. Everything else the service needs is created
+by the quick-start steps above and is not in git:
+
+```bash
+git clone git@github.com:gtoscano/Parascribe.git
+cd Parascribe
+cp .env.example .env && $EDITOR .env   # Hugging Face token (pyannote licenses accepted)
+python3 fetch_models.py                # weights into ~/.cache/huggingface and ~/.cache/torch
+python3 fetch_cohere.py                # Cohere weights into models/
+docker build -t parascribe-api:local ./parascribe
+docker compose up -d
+curl http://127.0.0.1:8357/health
+```
+
+- **Model caches** are the `~/.cache/huggingface` and `~/.cache/torch` of the
+  user who runs `docker compose`. A user without them downloads every model
+  again; `fetch_models.py` does this up front instead of on the first request.
+- **Session data** starts empty in the clone's `parascribe/data/`. Instances
+  started from different clones do not share sessions or transcripts.
+- **Root-owned files:** containers run as root, so files they create in
+  `parascribe/data/` and `~/.cache/torch` may need `sudo` to remove.
+
+**One instance per server.** All users in the `docker` group share one Docker
+daemon, and the project name, container names (`parascribe-0`,
+`parascribe-gateway`), ports, and image tag are fixed. Before starting, check
+that no other clone's deployment is running (`docker compose ls`) and stop it
+with `docker compose down`. Building replaces the shared `parascribe-api:local`
+image for every clone on the server.
 
 ### Naming migration
 
