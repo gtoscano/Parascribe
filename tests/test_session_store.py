@@ -19,6 +19,52 @@ class SessionStoreTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_utterance_attribution_round_trips(self):
+        session = self.store.create_session(capture_voiceprints=False)
+        stored = self.store.append_utterance(
+            session["session_id"], text="Buenas tardes", language="es",
+            speaker_id=None, speaker_similarity=None, audio_seconds=1.5,
+            source="realtime", speaker_label="Luis", spoken_at="2026-11-24T01:00:00+00:00")
+        self.assertEqual(stored["speaker_label"], "Luis")
+        fetched = self.store.get_session(session["session_id"], include_utterances=True)
+        self.assertEqual(
+            (fetched["utterances"][0]["speaker_label"], fetched["utterances"][0]["spoken_at"]),
+            ("Luis", "2026-11-24T01:00:00+00:00"))
+
+    def test_version_1_database_is_migrated_in_place(self):
+        path = Path(self.temp.name) / "v1.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.executescript("""
+            CREATE TABLE schema_info (version INTEGER NOT NULL);
+            INSERT INTO schema_info VALUES (1);
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, ended_at TEXT, status TEXT NOT NULL,
+                capture_voiceprints INTEGER NOT NULL, signatures_deleted_at TEXT,
+                metadata_json TEXT NOT NULL);
+            CREATE TABLE utterances (
+                utterance_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL, created_at TEXT NOT NULL, source TEXT NOT NULL,
+                text TEXT NOT NULL, language TEXT, speaker_id TEXT,
+                speaker_similarity REAL, audio_seconds REAL NOT NULL,
+                UNIQUE (session_id, sequence));
+            INSERT INTO sessions VALUES ('old', 't', 't', NULL, 'active', 0, NULL, '{}');
+            INSERT INTO utterances VALUES ('u1', 'old', 1, 't', 'sentence', 'Kept', 'en',
+                                           NULL, NULL, 1.0);
+        """)
+        connection.close()
+
+        store = SessionStore(path)
+        SessionStore(path)  # a second replica starting afterwards is a no-op
+        old = store.get_session("old", include_utterances=True)
+        self.assertEqual(old["utterances"][0]["text"], "Kept")
+        self.assertIsNone(old["utterances"][0]["speaker_label"])
+        store.append_utterance("old", text="New", language="en", speaker_id=None,
+                               speaker_similarity=None, audio_seconds=1.0,
+                               source="realtime", speaker_label="Ana")
+        version = sqlite3.connect(path).execute("SELECT version FROM schema_info").fetchone()[0]
+        self.assertEqual(version, 2)
+
     def test_voiceprints_are_scoped_to_one_session(self):
         first = self.store.create_session()
         second = self.store.create_session()

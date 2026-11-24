@@ -70,3 +70,6 @@ nextsteps.md
 .claude/
 .DS_Store
 *.swp
+
+# Meeting transcripts from the Jitsi bot contain participants' speech.
+transcripts/

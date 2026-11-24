@@ -405,6 +405,8 @@ def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
             "language": lang,
             "audio_seconds": audio_seconds,
             "source": job.get("source", "sentence"),
+            "speaker_label": job.get("speaker_label"),
+            "spoken_at": job.get("spoken_at"),
             "transcription": transcription,
             "speaker": None,
         }
@@ -429,6 +431,7 @@ def run_session_utterance(job: Dict[str, Any], models: "ModelSet"):
         job["session_id"], text=text, language=lang, speaker_id=None,
         speaker_similarity=None, audio_seconds=audio_seconds,
         source=job.get("source", "sentence"),
+        speaker_label=job.get("speaker_label"), spoken_at=job.get("spoken_at"),
     )
     match = {"speaker_id": None, "similarity": None, "enrolled": False,
              "pending": False, "relabeled": []}
@@ -791,6 +794,8 @@ def _new_session_job(
     asr_mode: str = SESSION_ASR_MODE,
     job_id: str | None = None,
     future=None,
+    speaker_label: str | None = None,
+    spoken_at: str | None = None,
 ) -> Dict[str, Any]:
     received_perf = time.perf_counter()
     now = _now()
@@ -806,6 +811,8 @@ def _new_session_job(
         "language": language,
         "session_id": session_id,
         "source": source,
+        "speaker_label": speaker_label,
+        "spoken_at": spoken_at,
         "received_at": now,
         "uploaded_at": now,
         "created_at": now,
@@ -841,11 +848,17 @@ async def transcribe_sentence(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     asr_mode: str = Form(SESSION_ASR_MODE),
+    speaker_label: Optional[str] = Form(None),
+    spoken_at: Optional[str] = Form(None),
 ):
     session = _session_or_404(session_id)
     if session["status"] != "active":
         raise HTTPException(409, "session has ended")
     _validate_session_asr(asr_mode, language)
+    try:
+        speaker_label, spoken_at = _attribution(speaker_label, spoken_at)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
 
     suffix = Path(file.filename or "utterance").suffix or ".wav"
     job_id = f"{REPLICA_ID}-{uuid.uuid4().hex[:12]}"
@@ -868,6 +881,7 @@ async def transcribe_sentence(
         upload_save_s=round(time.perf_counter() - started, 6),
         job_id=job_id,
         asr_mode=asr_mode,
+        speaker_label=speaker_label, spoken_at=spoken_at,
     )
     await _queue.put(job["job_id"])
     return JSONResponse(_public(job), status_code=202)
@@ -900,6 +914,37 @@ def _write_pcm16_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
         output.setsampwidth(2)
         output.setframerate(sample_rate)
         output.writeframes(pcm)
+
+
+SPEAKER_LABEL_MAX_CHARS = 120
+
+
+def _attribution(speaker_label, spoken_at) -> tuple[str | None, str | None]:
+    """Validate optional client attribution for one utterance.
+
+    ``speaker_label`` is a client assertion (e.g. a meeting display name), not
+    a verified identity, and is independent of session voice signatures.
+    ``spoken_at`` is an ISO 8601 timestamp of when the speech began, letting
+    clients that stream several participants order the transcript by speech
+    rather than by completion.
+    """
+    if speaker_label is not None:
+        if not isinstance(speaker_label, str):
+            raise ValueError("speaker_label must be a string")
+        speaker_label = " ".join(speaker_label.split()) or None
+        if speaker_label and len(speaker_label) > SPEAKER_LABEL_MAX_CHARS:
+            raise ValueError(f"speaker_label exceeds {SPEAKER_LABEL_MAX_CHARS} characters")
+    if spoken_at is not None:
+        if not isinstance(spoken_at, str) or len(spoken_at) > 40:
+            raise ValueError("spoken_at must be an ISO 8601 timestamp")
+        try:
+            parsed = datetime.fromisoformat(spoken_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("spoken_at must be an ISO 8601 timestamp") from error
+        if parsed.tzinfo is None:
+            raise ValueError("spoken_at must include a timezone")
+        spoken_at = parsed.astimezone(timezone.utc).isoformat()
+    return speaker_label, spoken_at
 
 
 def _validate_session_asr(mode: str, language: str | None) -> None:
@@ -971,7 +1016,7 @@ async def stream_session(ws: WebSocket, session_id: str):
             if item is None:
                 pending.task_done()
                 return
-            pcm, client_utterance_id, item_mode, item_language = item
+            pcm, client_utterance_id, item_mode, item_language, label, spoken = item
             job_id = f"{REPLICA_ID}-{uuid.uuid4().hex[:12]}"
             path = IN_DIR / f"{job_id}.wav"
             try:
@@ -984,6 +1029,7 @@ async def stream_session(ws: WebSocket, session_id: str):
                     upload_save_s=round(time.perf_counter() - write_started, 6),
                     job_id=job_id,
                     future=future,
+                    speaker_label=label, spoken_at=spoken,
                 )
                 await _queue.put(job["job_id"])
                 await send({"type": "utterance_queued", "job_id": job["job_id"],
@@ -1077,8 +1123,17 @@ async def stream_session(ws: WebSocket, session_id: str):
                     await send({"type": "error", "error": "no audio to commit"})
                     continue
                 client_id = str(command.get("utterance_id") or uuid.uuid4().hex)
+                try:
+                    label, spoken = _attribution(
+                        command.get("speaker_label"), command.get("spoken_at"))
+                except ValueError as error:
+                    # Keep the audio so the client can retry with valid fields.
+                    await send({"type": "error", "client_utterance_id": client_id,
+                                "error": str(error)})
+                    continue
                 invalidate_preview()
-                await pending.put((bytes(audio), client_id, asr_mode, language))
+                await pending.put((bytes(audio), client_id, asr_mode, language,
+                                   label, spoken))
                 audio.clear()
             elif kind == "delete_voiceprints":
                 deleted = await asyncio.to_thread(
@@ -1088,7 +1143,13 @@ async def stream_session(ws: WebSocket, session_id: str):
                 invalidate_preview()
                 if audio:
                     client_id = str(command.get("utterance_id") or uuid.uuid4().hex)
-                    await pending.put((bytes(audio), client_id, asr_mode, language))
+                    try:
+                        label, spoken = _attribution(
+                            command.get("speaker_label"), command.get("spoken_at"))
+                    except ValueError:
+                        label, spoken = None, None
+                    await pending.put((bytes(audio), client_id, asr_mode, language,
+                                       label, spoken))
                     audio.clear()
                 await pending.join()
                 ended = await asyncio.to_thread(

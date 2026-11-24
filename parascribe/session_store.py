@@ -19,7 +19,12 @@ from typing import Any, Iterator
 import numpy as np
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Version 2 adds client-supplied attribution to utterances: ``speaker_label`` (for
+# example a meeting participant's display name) and ``spoken_at`` (when the
+# speech began).  Both are optional; voice signatures are unaffected.
+_V2_COLUMNS = ("speaker_label TEXT", "spoken_at TEXT")
 
 
 def _now() -> str:
@@ -142,6 +147,8 @@ class SessionStore:
                     speaker_id TEXT,
                     speaker_similarity REAL,
                     audio_seconds REAL NOT NULL,
+                    speaker_label TEXT,
+                    spoken_at TEXT,
                     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
                     UNIQUE (session_id, sequence)
                 );
@@ -155,6 +162,14 @@ class SessionStore:
                 if row is None:
                     connection.execute(
                         "INSERT INTO schema_info(version) VALUES (?)", (SCHEMA_VERSION,))
+                elif row["version"] == 1:
+                    # Replicas share the database; tolerate one that already migrated.
+                    existing = {item["name"] for item in
+                                connection.execute("PRAGMA table_info(utterances)")}
+                    for column in _V2_COLUMNS:
+                        if column.split()[0] not in existing:
+                            connection.execute(f"ALTER TABLE utterances ADD COLUMN {column}")
+                    connection.execute("UPDATE schema_info SET version = ?", (SCHEMA_VERSION,))
                 elif row["version"] != SCHEMA_VERSION:
                     raise RuntimeError(
                         f"Unsupported session database schema {row['version']} "
@@ -215,7 +230,8 @@ class SessionStore:
                     dict(item)
                     for item in connection.execute(
                         """SELECT utterance_id, sequence, created_at, source, text,
-                                  language, speaker_id, speaker_similarity, audio_seconds
+                                  language, speaker_id, speaker_similarity, audio_seconds,
+                                  speaker_label, spoken_at
                            FROM utterances WHERE session_id = ? ORDER BY sequence""",
                         (session_id,),
                     )
@@ -398,6 +414,8 @@ class SessionStore:
         audio_seconds: float,
         source: str,
         utterance_id: str | None = None,
+        speaker_label: str | None = None,
+        spoken_at: str | None = None,
     ) -> dict:
         now = _now()
         utterance_id = utterance_id or uuid.uuid4().hex
@@ -416,11 +434,12 @@ class SessionStore:
             connection.execute(
                 """INSERT INTO utterances(
                        utterance_id, session_id, sequence, created_at, source, text,
-                       language, speaker_id, speaker_similarity, audio_seconds
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       language, speaker_id, speaker_similarity, audio_seconds,
+                       speaker_label, spoken_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     utterance_id, session_id, sequence, now, source, text, language,
-                    speaker_id, speaker_similarity, audio_seconds,
+                    speaker_id, speaker_similarity, audio_seconds, speaker_label, spoken_at,
                 ),
             )
             connection.execute(
@@ -438,6 +457,8 @@ class SessionStore:
             "speaker_id": speaker_id,
             "speaker_similarity": speaker_similarity,
             "audio_seconds": audio_seconds,
+            "speaker_label": speaker_label,
+            "spoken_at": spoken_at,
         }
 
     def delete_voiceprints(self, session_id: str) -> int:

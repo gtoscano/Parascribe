@@ -226,6 +226,50 @@ class SessionApiTest(unittest.TestCase):
             stored = client.get(f"/v2/sessions/{session_id}").json()["utterances"]
             self.assertEqual([u["speaker_id"] for u in stored], ["speaker_1", "speaker_1"])
 
+    def test_commit_attribution_is_validated_and_stored(self):
+        import numpy as np
+        from test_sentence_asr import FakeTranscriber
+
+        with patch.object(server.ModelSet, "get_sentence_asr", return_value=FakeTranscriber("test", "Hola")), \
+                patch.object(server, "_load_audio_16k", return_value=np.zeros(16000)), \
+                TestClient(server.app) as client:
+            session_id = client.post(
+                "/v2/sessions", json={"capture_voiceprints": False}).json()["session_id"]
+            with client.websocket_connect(f"/v2/sessions/{session_id}/stream") as socket:
+                socket.receive_json()
+                socket.send_json({"type": "start"})
+                socket.receive_json()
+                socket.send_bytes(b"\0\0" * 16000)
+                # Invalid attribution is rejected but the audio is kept for a retry.
+                socket.send_json({"type": "commit", "utterance_id": "a",
+                                  "spoken_at": "yesterday"})
+                rejected = socket.receive_json()
+                self.assertEqual(rejected["type"], "error")
+                self.assertEqual(rejected["client_utterance_id"], "a")
+                socket.send_json({"type": "commit", "utterance_id": "a",
+                                  "speaker_label": "  Ana   María ",
+                                  "spoken_at": "2026-11-23T20:00:01.500-05:00"})
+                self.assertEqual(socket.receive_json()["type"], "utterance_queued")
+                result = socket.receive_json()["result"]
+                self.assertEqual(result["speaker_label"], "Ana María")
+                self.assertEqual(result["spoken_at"], "2026-11-24T01:00:01.500000+00:00")
+                self.assertIsNone(result["speaker_id"])
+                socket.send_json({"type": "end"})
+                socket.receive_json()
+
+            stored = client.get(f"/v2/sessions/{session_id}").json()["utterances"]
+            self.assertEqual([(u["speaker_label"], u["text"]) for u in stored],
+                             [("Ana María", "Hola")])
+
+    def test_sentence_upload_rejects_overlong_label(self):
+        with TestClient(server.app) as client:
+            session_id = client.post("/v2/sessions", json={}).json()["session_id"]
+            response = client.post(
+                f"/v2/sessions/{session_id}/sentences",
+                data={"speaker_label": "x" * (server.SPEAKER_LABEL_MAX_CHARS + 1)},
+                files={"file": ("test.wav", b"unused", "audio/wav")})
+            self.assertEqual(response.status_code, 400)
+
     def test_session_lifecycle_and_voiceprint_deletion(self):
         with TestClient(server.app) as client:
             created = client.post(

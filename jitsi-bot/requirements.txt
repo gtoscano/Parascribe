@@ -1,0 +1,3 @@
+# Must match the Playwright base image version in the Dockerfile.
+playwright==1.55.0
+websockets==15.0.1

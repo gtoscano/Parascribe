@@ -325,6 +325,30 @@ The client may also send `{"type":"delete_voiceprints"}` before the end or
 `{"type":"ping"}`. One committed utterance is limited to 60 seconds by
 default. A disconnect does not end the session, allowing reconnection.
 
+### Client attribution (`speaker_label`, `spoken_at`)
+
+A `commit` (or a REST sentence upload, as form fields) may carry two optional
+fields that are stored with the utterance and returned in results and in
+`GET /v2/sessions/{id}`:
+
+```json
+{"type":"commit","utterance_id":"t1-ab12","speaker_label":"Ana",
+ "spoken_at":"2026-11-23T20:00:01.5-05:00"}
+```
+
+- `speaker_label` (at most 120 characters; whitespace collapsed) is the
+  client's own label, such as a meeting display name. It is an
+  assertion, not a verified identity, and is independent of voice signatures.
+- `spoken_at` is an ISO 8601 timestamp with a timezone for when the speech
+  began, normalized to UTC. Clients streaming several participants at once use
+  it to order the transcript by speech rather than by completion.
+
+An invalid value returns an `error` with the `client_utterance_id` and keeps
+the buffered audio so the client can retry. Several WebSocket connections may
+stream into the same session at once; the Jitsi bot (`jitsi-bot/`) opens one per
+participant track. Sessions created before schema version 2 are migrated in
+place, and older utterances have `null` for both fields.
+
 Nginx is configured to forward WebSocket upgrade headers. Once a connection is
 established it remains on one replica, while the SQLite session remains visible
 to every replica.
